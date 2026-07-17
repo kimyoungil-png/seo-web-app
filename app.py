@@ -1,102 +1,199 @@
-import streamlit as st
-import datetime
+import json
+from datetime import datetime
 from pathlib import Path
-import backend
 
-import os
-# --- クラウド環境用のPlaywright自動インストール ---
-os.system("playwright install chromium")
+import streamlit as st
 
-st.set_page_config(page_title="SEO Growth Navigator", layout="wide")
-st.title("🚀 SEO Growth Navigator (Web Edition)")
+from backend import (
+    MODEL_OPTIONS,
+    get_llm_client,
+    get_model_config,
+    step2_fetch_serp_and_filter,
+    step3_generate_outline,
+    step4_propose_originality,
+    step5_generate_sections_and_assemble,
+    step6_fact_check,
+)
 
-# --- 状態管理（Session State）の初期化 ---
-if "step" not in st.session_state:
-    st.session_state.step = 1
-if "run_dir" not in st.session_state:
-    st.session_state.run_dir = None
-if "outline" not in st.session_state:
-    st.session_state.outline = ""
-if "serp_data" not in st.session_state:
-    st.session_state.serp_data = None
+st.set_page_config(page_title="SEO Article Generator", page_icon="📝", layout="wide")
+st.title("SEO Article Generator")
 
-# --- サイドバー：設定 ---
-st.sidebar.header("⚙️ 設定")
-# 💡 ここでAIを選択できるように変更しました！
-llm_choice = st.sidebar.selectbox("🤖 使用するAIを選択", ["Gemini (1.5 Flash)", "OpenAI (GPT-4o)"])
-api_key = st.sidebar.text_input("🔑 API Key", type="password", help="選択したAIのAPIキーを入力してください")
+for key, default in {
+    "serp_data": None,
+    "outline": "",
+    "originality_proposals": None,
+    "selected_originality": None,
+    "article": "",
+    "fact_check": "",
+    "run_dir": None,
+}.items():
+    st.session_state.setdefault(key, default)
 
-# ==========================================
-# Step 1: キーワード入力
-# ==========================================
-st.header("1. 対策キーワードの入力")
-keyword = st.text_input("キーワードを入力してください", placeholder="例：リモートワーク 課題")
+with st.sidebar:
+    st.header("API設定")
+    llm_choice = st.selectbox("使用するAI", list(MODEL_OPTIONS.keys()))
+    model_config = get_model_config(llm_choice)
+    st.caption(f"実際のモデルID: `{model_config['model']}`")
 
-if st.button("競合分析と構成案の生成を開始"):
-    if not api_key or not keyword:
-        st.error("APIキーとキーワードを入力してください。")
+    if model_config["provider"] == "gemini":
+        api_key = st.text_input("Gemini API Key", type="password")
     else:
-        st.session_state.step = 1
-        
-        with st.status("🔍 裏側で処理を実行中...", expanded=True) as status:
-            # 選択したAIのクライアントを初期化
-            client = backend.get_llm_client(api_key, llm_choice)
-            
-            run_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M')}-{keyword.replace(' ', '-')}"
-            run_dir = Path(f".seo/runs/{run_id}")
-            run_dir.mkdir(parents=True, exist_ok=True)
-            st.session_state.run_dir = run_dir
-            
-            st.write("① 競合SERPを取得・サニタイズしています...")
-            serp_data = backend.step2_fetch_serp_and_filter(keyword, run_id, run_dir)
-            st.session_state.serp_data = serp_data
-            
-            st.write(f"② {llm_choice} が構成案を作成しています...")
-            outline = backend.step3_generate_outline(client, llm_choice, keyword, serp_data, run_dir)
-            st.session_state.outline = outline
-            
-            status.update(label="構成案の生成が完了しました！", state="complete", expanded=False)
-            
-        st.session_state.step = 2
-        st.rerun()
+        api_key = st.text_input("OpenAI API Key", type="password")
 
-# ==========================================
-# Step 2: 構成案の編集・確定
-# ==========================================
-if st.session_state.step >= 2:
-    st.divider()
-    st.header("2. 構成案の確認・編集")
-    st.info("💡 AIが競合を分析して作成した構成案です。必要に応じて手動で見出しや要点を加筆・修正してください。\n※ システムが識別するため、各H2の `[id: h2-01]` などのタグは消さないでください。")
-    
-    edited_outline = st.text_area("構成案 (Markdown)", value=st.session_state.outline, height=400)
-    
-    if st.button("✨ この構成で本文を執筆する"):
-        st.session_state.outline = edited_outline
-        (st.session_state.run_dir / "04-outline.md").write_text(edited_outline, encoding="utf-8")
-        st.session_state.step = 3
-        st.rerun()
+keyword = st.text_input("対策キーワード")
 
-# ==========================================
-# Step 3: 本文執筆と最終出力
-# ==========================================
-if st.session_state.step == 3:
-    st.divider()
-    st.header("3. 記事の生成結果")
-    
-    with st.spinner(f"✍️ {llm_choice} が各H2セクションを執筆・統合しています...（数分かかる場合があります）"):
-        client = backend.get_llm_client(api_key, llm_choice)
-        final_article = backend.step4_generate_sections_and_assemble(
-            client, llm_choice, keyword, st.session_state.outline, st.session_state.run_dir
+if keyword and api_key and st.session_state.run_dir is None:
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = Path(".seo") / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    st.session_state.run_dir = run_dir
+
+st.header("1. 競合SERPの取得")
+if st.button("競合SERPを取得", disabled=not (keyword and api_key)):
+    try:
+        with st.spinner("競合SERPを取得しています..."):
+            st.session_state.serp_data = step2_fetch_serp_and_filter(
+                keyword, st.session_state.run_dir.name, st.session_state.run_dir
+            )
+        st.success("競合SERPを取得しました。")
+    except Exception as exc:
+        st.error(f"SERP取得エラー: {exc}")
+
+if st.session_state.serp_data:
+    rows = []
+    for result in st.session_state.serp_data.get("results", []):
+        headings = result.get("headings", {})
+        rows.append(
+            {
+                "順位": result.get("rank"),
+                "タイトル": result.get("title"),
+                "URL": result.get("url"),
+                "H2数": len(headings.get("h2", [])),
+                "H3数": len(headings.get("h3", [])),
+            }
         )
-        
-    st.success("🎉 記事の生成が完了しました！")
-    
-    st.download_button(
-        label="📥 Markdownファイルとしてダウンロード",
-        data=final_article,
-        file_name=f"article_{keyword}.md",
-        mime="text/markdown"
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    for result in st.session_state.serp_data.get("results", []):
+        with st.expander(f"{result.get('rank')}位: {result.get('title') or result.get('url')}"):
+            st.markdown(f"[{result.get('url')}]({result.get('url')})")
+            st.write("H2", result.get("headings", {}).get("h2", []))
+            st.write("H3", result.get("headings", {}).get("h3", []))
+
+st.header("2. 構成案の確認・編集")
+if st.button(
+    "構成案を生成",
+    disabled=not (api_key and keyword and st.session_state.serp_data),
+):
+    try:
+        client = get_llm_client(api_key, llm_choice)
+        with st.spinner("構成案を生成しています..."):
+            st.session_state.outline = step3_generate_outline(
+                client,
+                llm_choice,
+                keyword,
+                st.session_state.serp_data,
+                st.session_state.run_dir,
+            )
+    except Exception as exc:
+        st.error(f"構成案生成エラー: {exc}")
+
+if st.session_state.outline:
+    st.session_state.outline = st.text_area(
+        "構成案は直接編集できます",
+        value=st.session_state.outline,
+        height=420,
     )
-    
-    with st.expander("プレビューを表示", expanded=True):
-        st.markdown(final_article)
+
+st.header("3. 独自性（オリジナル要素）の提案")
+if st.button(
+    "SERPにない独自要素を3件提案",
+    disabled=not (api_key and st.session_state.outline and st.session_state.serp_data),
+):
+    try:
+        client = get_llm_client(api_key, llm_choice)
+        with st.spinner("競合との差別化案を考えています..."):
+            st.session_state.originality_proposals = step4_propose_originality(
+                client,
+                llm_choice,
+                keyword,
+                st.session_state.serp_data,
+                st.session_state.outline,
+                st.session_state.run_dir,
+            )
+    except Exception as exc:
+        st.error(f"独自性提案エラー: {exc}")
+
+if st.session_state.originality_proposals:
+    choices = {
+        f"{i + 1}. {item.get('title', '提案')}": item
+        for i, item in enumerate(st.session_state.originality_proposals)
+    }
+    for label, item in choices.items():
+        with st.expander(label, expanded=True):
+            st.write(item.get("description", ""))
+            st.caption(f"推奨挿入箇所: {item.get('placement', '')}")
+    selected_label = st.radio("記事に採用する独自要素", list(choices.keys()))
+    st.session_state.selected_originality = choices[selected_label]
+
+st.header("4. 記事の生成")
+if st.button(
+    "記事を生成",
+    disabled=not (
+        api_key
+        and st.session_state.outline
+        and st.session_state.selected_originality
+    ),
+):
+    try:
+        client = get_llm_client(api_key, llm_choice)
+        with st.spinner("記事を生成しています..."):
+            st.session_state.article = step5_generate_sections_and_assemble(
+                client,
+                llm_choice,
+                keyword,
+                st.session_state.outline,
+                st.session_state.selected_originality,
+                st.session_state.run_dir,
+            )
+    except Exception as exc:
+        st.error(f"記事生成エラー: {exc}")
+
+if st.session_state.article:
+    st.session_state.article = st.text_area(
+        "生成記事",
+        value=st.session_state.article,
+        height=600,
+    )
+    st.download_button(
+        "記事をMarkdownでダウンロード",
+        st.session_state.article,
+        file_name="article.md",
+        mime="text/markdown",
+    )
+
+st.header("5. ファクトチェック")
+st.caption("Web検索を利用して、記事内の検証可能な主張を一覧化し、出典付きで判定します。")
+if st.button(
+    "記事をファクトチェック",
+    disabled=not (api_key and st.session_state.article),
+):
+    try:
+        client = get_llm_client(api_key, llm_choice)
+        with st.spinner("記事全体を調査・検証しています..."):
+            st.session_state.fact_check = step6_fact_check(
+                client,
+                llm_choice,
+                st.session_state.article,
+                st.session_state.run_dir,
+            )
+    except Exception as exc:
+        st.error(f"ファクトチェックエラー: {exc}")
+
+if st.session_state.fact_check:
+    st.markdown(st.session_state.fact_check)
+    st.download_button(
+        "ファクトチェック結果をダウンロード",
+        st.session_state.fact_check,
+        file_name="fact-check.md",
+        mime="text/markdown",
+    )
