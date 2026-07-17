@@ -1,11 +1,11 @@
-import json
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
-from backend import (
+from backend_updated import (
     MODEL_OPTIONS,
+    SERP_PROVIDER_OPTIONS,
     get_llm_client,
     get_model_config,
     step2_fetch_serp_and_filter,
@@ -29,34 +29,98 @@ for key, default in {
 }.items():
     st.session_state.setdefault(key, default)
 
+
+def secret(name: str) -> str:
+    try:
+        return str(st.secrets.get(name, ""))
+    except Exception:
+        return ""
+
+
 with st.sidebar:
-    st.header("API設定")
+    st.header("AI API設定")
     llm_choice = st.selectbox("使用するAI", list(MODEL_OPTIONS.keys()))
     model_config = get_model_config(llm_choice)
     st.caption(f"実際のモデルID: `{model_config['model']}`")
 
     if model_config["provider"] == "gemini":
-        api_key = st.text_input("Gemini API Key", type="password")
+        api_key = st.text_input(
+            "Gemini API Key", value=secret("GEMINI_API_KEY"), type="password"
+        )
     else:
-        api_key = st.text_input("OpenAI API Key", type="password")
+        api_key = st.text_input(
+            "OpenAI API Key", value=secret("OPENAI_API_KEY"), type="password"
+        )
+
+    st.divider()
+    st.header("SERP API設定")
+    serp_provider_label = "Brave Search API"
+    serp_provider = "brave"
+    brave_api_key = st.text_input(
+        "Brave Search API Key",
+        value=secret("BRAVE_SEARCH_API_KEY"),
+        type="password",
+    )
+
+    country_options = {
+        "Tokyo, Japan": {"country": "JP", "default_ui_lang": "ja-JP"},
+        "Seoul, South Korea": {"country": "KR", "default_ui_lang": "ko-KR"},
+        "United States": {"country": "US", "default_ui_lang": "en-US"},
+    }
+    selected_country_label = st.selectbox(
+        "検索対象国・地域", list(country_options.keys())
+    )
+
+    language_options = {
+        "日本語（jp / API送信値: ja）": {"search_lang": "ja", "ui_lang": "ja-JP"},
+        "한국어（ko）": {"search_lang": "ko", "ui_lang": "ko-KR"},
+        "English（en）": {"search_lang": "en", "ui_lang": "en-US"},
+    }
+    selected_language_label = st.selectbox(
+        "検索言語", list(language_options.keys())
+    )
+    result_count = st.selectbox("取得件数", [5, 8, 10, 15, 20], index=1)
+
+    country_config = country_options[selected_country_label]
+    language_config = language_options[selected_language_label]
+    serp_credentials = {
+        "api_key": brave_api_key,
+        "country": country_config["country"],
+        "search_lang": language_config["search_lang"],
+        "ui_lang": language_config["ui_lang"],
+    }
+    st.caption(
+        "Brave Web Search APIを使用します。Tokyo/Seoulは画面上の地域名で、"
+        "APIのcountryにはJP/KR/USを送信します。"
+    )
 
 keyword = st.text_input("対策キーワード")
 
-if keyword and api_key and st.session_state.run_dir is None:
+if keyword and st.session_state.run_dir is None:
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(".seo") / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     st.session_state.run_dir = run_dir
 
 st.header("1. 競合SERPの取得")
-if st.button("競合SERPを取得", disabled=not (keyword and api_key)):
+if st.button("競合SERPを取得", disabled=not keyword):
     try:
-        with st.spinner("競合SERPを取得しています..."):
+        with st.spinner(f"{serp_provider_label}から競合SERPを取得しています..."):
             st.session_state.serp_data = step2_fetch_serp_and_filter(
-                keyword, st.session_state.run_dir.name, st.session_state.run_dir
+                keyword,
+                st.session_state.run_dir.name,
+                st.session_state.run_dir,
+                provider=serp_provider,
+                credentials=serp_credentials,
+                top_n=result_count,
             )
-        st.success("競合SERPを取得しました。")
+        result_count = len(st.session_state.serp_data.get("results", []))
+        st.success(
+            f"{serp_provider_label}から競合SERPを{result_count}件取得しました。"
+            f"（{selected_country_label} / {selected_language_label}）"
+        )
     except Exception as exc:
+        st.session_state.serp_data = None
         st.error(f"SERP取得エラー: {exc}")
 
 if st.session_state.serp_data:
@@ -68,14 +132,24 @@ if st.session_state.serp_data:
                 "順位": result.get("rank"),
                 "タイトル": result.get("title"),
                 "URL": result.get("url"),
+                "スニペット": result.get("snippet", ""),
                 "H2数": len(headings.get("h2", [])),
                 "H3数": len(headings.get("h3", [])),
             }
         )
     st.dataframe(rows, use_container_width=True, hide_index=True)
+    diagnostics = st.session_state.serp_data.get("diagnostics", {})
+    st.caption(
+        f"API結果 {diagnostics.get('raw_count', 0)}件 / "
+        f"見出し取得成功 {diagnostics.get('valid_count', 0)}件 / "
+        f"取得失敗 {diagnostics.get('failed_count', 0)}件 / "
+        f"安全フィルター除外 {diagnostics.get('blocked_count', 0)}件"
+    )
     for result in st.session_state.serp_data.get("results", []):
         with st.expander(f"{result.get('rank')}位: {result.get('title') or result.get('url')}"):
             st.markdown(f"[{result.get('url')}]({result.get('url')})")
+            if result.get("snippet"):
+                st.write(result.get("snippet"))
             st.write("H2", result.get("headings", {}).get("h2", []))
             st.write("H3", result.get("headings", {}).get("h3", []))
 
@@ -88,20 +162,14 @@ if st.button(
         client = get_llm_client(api_key, llm_choice)
         with st.spinner("構成案を生成しています..."):
             st.session_state.outline = step3_generate_outline(
-                client,
-                llm_choice,
-                keyword,
-                st.session_state.serp_data,
-                st.session_state.run_dir,
+                client, llm_choice, keyword, st.session_state.serp_data, st.session_state.run_dir
             )
     except Exception as exc:
         st.error(f"構成案生成エラー: {exc}")
 
 if st.session_state.outline:
     st.session_state.outline = st.text_area(
-        "構成案は直接編集できます",
-        value=st.session_state.outline,
-        height=420,
+        "構成案は直接編集できます", value=st.session_state.outline, height=420
     )
 
 st.header("3. 独自性（オリジナル要素）の提案")
@@ -138,11 +206,7 @@ if st.session_state.originality_proposals:
 st.header("4. 記事の生成")
 if st.button(
     "記事を生成",
-    disabled=not (
-        api_key
-        and st.session_state.outline
-        and st.session_state.selected_originality
-    ),
+    disabled=not (api_key and st.session_state.outline and st.session_state.selected_originality),
 ):
     try:
         client = get_llm_client(api_key, llm_choice)
@@ -160,9 +224,7 @@ if st.button(
 
 if st.session_state.article:
     st.session_state.article = st.text_area(
-        "生成記事",
-        value=st.session_state.article,
-        height=600,
+        "生成記事", value=st.session_state.article, height=600
     )
     st.download_button(
         "記事をMarkdownでダウンロード",
@@ -172,19 +234,17 @@ if st.session_state.article:
     )
 
 st.header("5. ファクトチェック")
-st.caption("Web検索を利用して、記事内の検証可能な主張を一覧化し、出典付きで判定します。")
+st.caption(
+    "factcheck-prompt.mdを読み込み、選択中のAIのWeb検索機能で記事を検証します。"
+)
 if st.button(
-    "記事をファクトチェック",
-    disabled=not (api_key and st.session_state.article),
+    "記事をファクトチェック", disabled=not (api_key and st.session_state.article)
 ):
     try:
         client = get_llm_client(api_key, llm_choice)
         with st.spinner("記事全体を調査・検証しています..."):
             st.session_state.fact_check = step6_fact_check(
-                client,
-                llm_choice,
-                st.session_state.article,
-                st.session_state.run_dir,
+                client, llm_choice, st.session_state.article, st.session_state.run_dir
             )
     except Exception as exc:
         st.error(f"ファクトチェックエラー: {exc}")

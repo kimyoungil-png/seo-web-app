@@ -1,8 +1,11 @@
+import base64
 import json
 import re
 import time
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from google import genai
 from google.genai import types
@@ -86,28 +89,166 @@ def load_prompt_file(filename: str) -> str:
     return ""
 
 
-def step2_fetch_serp_and_filter(keyword: str, run_id: str, run_dir: Path) -> dict:
-    out_path = run_dir / "03-serp.json"
-    status_code = fetch_serp.run(
-        keyword=keyword,
-        top_n=8,
-        out_path=out_path,
-        user_agent="ictGrowthHacker-SerpFetcher/1.0",
-        timeout=15.0,
-        exclude_hosts=[],
-        run_id=run_id,
-        engine="http",
-    )
-    if status_code != 0 and not out_path.exists():
-        raise RuntimeError("SERPの取得に失敗しました。")
+SERP_PROVIDER_OPTIONS = {
+    "Brave Search API": "brave",
+}
 
-    serp_data = json.loads(out_path.read_text(encoding="utf-8"))
-    serp_data["results"] = [
-        result
-        for result in serp_data.get("results", [])
-        if result.get("blocked_count", 0) == 0
-        and not result.get("fetch_error", False)
+def _extract_page_details(rank: int, item: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
+    """SERP APIの結果URLからtitle/H2/H3を取得し、既存の安全検査を適用する。"""
+    url = item.get("url", "")
+    result = {
+        "rank": rank,
+        "url": url,
+        "title": item.get("title"),
+        "snippet": item.get("snippet", ""),
+        "headings": {"h2": [], "h3": []},
+        "fetch_error": False,
+        "blocked_count": 0,
+        "notes": [],
+    }
+    if not url:
+        result["fetch_error"] = True
+        result["notes"].append("missing_url")
+        return result
+
+    try:
+        title, h2, h3, notes = fetch_serp.fetch_page_headings(
+            url=url,
+            user_agent="ictGrowthHacker-SerpFetcher/1.0",
+            timeout=timeout,
+        )
+        result["title"] = title or result["title"]
+        result["headings"] = {"h2": h2, "h3": h3}
+        result["notes"].extend(notes)
+        payload_hits = fetch_serp.count_payload_hits(h2) + fetch_serp.count_payload_hits(h3)
+        if payload_hits:
+            result["blocked_count"] = payload_hits
+            result["headings"] = {"h2": [], "h3": []}
+            result["notes"].append("injection_suspected")
+    except Exception as exc:
+        result["fetch_error"] = True
+        result["notes"].append(f"fetch_error:{type(exc).__name__}:{exc}")
+    return result
+
+
+def _search_brave(
+    keyword: str,
+    api_key: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> list[dict[str, Any]]:
+    """Brave Web Search APIから通常のWeb検索結果を取得する。"""
+    if not api_key:
+        raise ValueError("Brave Search API Keyを入力してください。")
+
+    response = httpx.get(
+        "https://api.search.brave.com/res/v1/web/search",
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": api_key,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.0.0 Safari/537.36"
+            ),
+        },
+        params={
+            "q": keyword,
+            "country": country,
+            "search_lang": search_lang,
+            "ui_lang": ui_lang,
+            "count": min(max(top_n, 1), 20),
+            "offset": 0,
+            "safesearch": "moderate",
+            "spellcheck": "true",
+            "text_decorations": "false",
+            "result_filter": "web",
+        },
+        timeout=30.0,
+    )
+
+    if response.status_code == 401:
+        raise RuntimeError("Brave Search APIキーが無効です。")
+    if response.status_code == 403:
+        raise RuntimeError("Brave Search APIの利用権限または契約プランを確認してください。")
+    if response.status_code == 429:
+        raise RuntimeError("Brave Search APIのレート制限に達しました。しばらく待って再実行してください。")
+    response.raise_for_status()
+
+    data = response.json()
+    web_results = (data.get("web") or {}).get("results") or []
+    return [
+        {
+            "url": row.get("url", ""),
+            "title": row.get("title"),
+            "snippet": row.get("description", ""),
+        }
+        for row in web_results[:top_n]
+        if row.get("url")
     ]
+
+def step2_fetch_serp_and_filter(
+    keyword: str,
+    run_id: str,
+    run_dir: Path,
+    *,
+    provider: str,
+    credentials: dict[str, str],
+    top_n: int = 8,
+) -> dict:
+    """外部SERP APIで順位URLを取得し、各URLの見出しを安全に抽出する。"""
+    if provider == "brave":
+        candidates = _search_brave(
+            keyword,
+            credentials.get("api_key", ""),
+            top_n,
+            country=credentials.get("country", "JP"),
+            search_lang=credentials.get("search_lang", "ja"),
+            ui_lang=credentials.get("ui_lang", "ja-JP"),
+        )
+    else:
+        raise ValueError(f"未対応のSERPプロバイダーです: {provider}")
+
+    if not candidates:
+        raise RuntimeError("SERP APIからオーガニック検索結果を取得できませんでした。")
+
+    raw_results = [_extract_page_details(rank, item) for rank, item in enumerate(candidates, 1)]
+    valid_results = [
+        result
+        for result in raw_results
+        if result.get("blocked_count", 0) == 0 and not result.get("fetch_error", False)
+    ]
+
+    serp_data = {
+        "run_id": run_id,
+        "keyword": keyword,
+        "provider": provider,
+        "search_settings": {
+            "country": credentials.get("country", "JP"),
+            "search_lang": credentials.get("search_lang", "ja"),
+            "ui_lang": credentials.get("ui_lang", "ja-JP"),
+        },
+        "results": valid_results,
+        "diagnostics": {
+            "raw_count": len(raw_results),
+            "valid_count": len(valid_results),
+            "failed_count": sum(bool(r.get("fetch_error")) for r in raw_results),
+            "blocked_count": sum(bool(r.get("blocked_count", 0)) for r in raw_results),
+        },
+    }
+    (run_dir / "03-serp.json").write_text(
+        json.dumps(serp_data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    if not valid_results:
+        raise RuntimeError(
+            "順位URLは取得できましたが、本文の見出しを取得できるページがありませんでした。"
+            "対象サイト側のアクセス制限を確認してください。"
+        )
     return serp_data
 
 
@@ -249,38 +390,21 @@ def step5_generate_sections_and_assemble(
     return full_article
 
 
-FACT_CHECK_SYSTEM_PROMPT = """
-You are a meticulous fact checker. Fact check the supplied article in full and leave no stone unturned.
-
-First, parse the article into individual verifiable factual claims. Do not treat opinions, recommendations, or clearly marked hypotheses as facts.
-
-For every factual claim:
-1. Conduct comprehensive web research.
-2. Prefer primary sources, official documentation, government sources, peer-reviewed research, or highly reputable reporting.
-3. Aim for at least three independent high-quality sources where available.
-4. Classify the claim as True, False, Misleading, Unclear, or Time-sensitive.
-5. Explain the conclusion briefly.
-6. Include source title and URL for every source used.
-7. Suggest corrected wording when the claim is false, misleading, unclear, or time-sensitive.
-
-Return a Markdown table with these columns:
-Claim | Verdict | Reasoning | Sources | Suggested correction
-
-After the table, add a short section titled "Priority corrections" listing the statements that should be fixed before publication.
-Do not invent sources or URLs. State clearly when sufficient evidence is unavailable.
-"""
-
-
 def step6_fact_check(
     client: Any,
     llm_choice: str,
     article: str,
     run_dir: Path,
 ) -> str:
+    factcheck_prompt = load_prompt_file("factcheck-prompt.md")
+    if not factcheck_prompt.strip():
+        raise FileNotFoundError(
+            "factcheck-prompt.mdが見つかりません。アプリのルートまたはreferencesに配置してください。"
+        )
     report = generate_text(
         client,
         llm_choice,
-        FACT_CHECK_SYSTEM_PROMPT,
+        factcheck_prompt,
         article,
         use_web_search=True,
     )
