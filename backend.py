@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from collections import Counter
 
 import httpx
 
@@ -144,39 +145,68 @@ def _search_brave(
     if not api_key:
         raise ValueError("Brave Search API Keyを入力してください。")
 
-    response = httpx.get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip",
-            "X-Subscription-Token": api_key,
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/134.0.0.0 Safari/537.36"
-            ),
-        },
-        params={
-            "q": keyword,
-            "country": country,
-            "search_lang": search_lang,
-            "ui_lang": ui_lang,
-            "count": min(max(top_n, 1), 20),
-            "offset": 0,
-            "safesearch": "moderate",
-            "spellcheck": "true",
-            "text_decorations": "false",
-            "result_filter": "web",
-        },
-        timeout=30.0,
-    )
+    url = "https://api.search.brave.com/res/v1/web/search"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": api_key,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/134.0.0.0 Safari/537.36"
+        ),
+    }
+    params = {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 20),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": "true",
+        "text_decorations": "false",
+        "result_filter": "web",
+    }
 
+    response = httpx.get(url, headers=headers, params=params, timeout=30.0)
+
+    # Handle common error statuses with clearer messages
     if response.status_code == 401:
         raise RuntimeError("Brave Search APIキーが無効です。")
     if response.status_code == 403:
         raise RuntimeError("Brave Search APIの利用権限または契約プランを確認してください。")
     if response.status_code == 429:
         raise RuntimeError("Brave Search APIのレート制限に達しました。しばらく待って再実行してください。")
+
+    # Special handling for 422 Unprocessable Entity: try a shorter ui_lang (e.g. 'ja' from 'ja-JP')
+    if response.status_code == 422:
+        try:
+            short_ui = ui_lang.split("-")[0]
+            if short_ui and short_ui != ui_lang:
+                params["ui_lang"] = short_ui
+                retry_resp = httpx.get(url, headers=headers, params=params, timeout=30.0)
+                if retry_resp.status_code == 200:
+                    data = retry_resp.json()
+                    web_results = (data.get("web") or {}).get("results") or []
+                    return [
+                        {
+                            "url": row.get("url", ""),
+                            "title": row.get("title"),
+                            "snippet": row.get("description", ""),
+                        }
+                        for row in web_results[:top_n]
+                        if row.get("url")
+                    ]
+                # fall through to raise below
+        except Exception:
+            pass
+        # include response body for debugging
+        raise RuntimeError(
+            f"Brave Search API returned 422 Unprocessable Entity. Response body: {response.text}"
+        )
+
+    # For other non-success statuses, raise generic
     response.raise_for_status()
 
     data = response.json()
@@ -270,12 +300,50 @@ def build_serp_summary(serp_data: dict) -> str:
     return "\n\n".join(lines)
 
 
+def analyze_serp(serp_data: dict) -> str:
+    """SERP全体の頻出見出しと検索意図の手掛かりを簡潔にまとめる。"""
+    results = serp_data.get("results", [])
+    h2_counter: Counter[str] = Counter()
+    h3_counter: Counter[str] = Counter()
+    for result in results:
+        headings = result.get("headings", {})
+        for heading in headings.get("h2", []):
+            normalized = re.sub(r"\s+", " ", str(heading)).strip()
+            if normalized:
+                h2_counter[normalized] += 1
+        for heading in headings.get("h3", []):
+            normalized = re.sub(r"\s+", " ", str(heading)).strip()
+            if normalized:
+                h3_counter[normalized] += 1
+
+    lines = [f"### SERP分析（取得 {len(results)}件）", "", "#### 頻出H2"]
+    if h2_counter:
+        lines.extend([f"- {title}（{count}ページ）" for title, count in h2_counter.most_common(12)])
+    else:
+        lines.append("- 抽出できませんでした")
+    lines.extend(["", "#### 頻出H3"])
+    if h3_counter:
+        lines.extend([f"- {title}（{count}ページ）" for title, count in h3_counter.most_common(15)])
+    else:
+        lines.append("- 抽出できませんでした")
+    lines.extend([
+        "",
+        "#### 構成作成時の判断基準",
+        "- 複数ページで共通する論点は検索意図の中核として優先する",
+        "- 単一ページだけの見出しは必要性を検討し、網羅性のために機械的には追加しない",
+        "- タイトル・スニペット・H2・H3を照合し、重複をまとめて自然な章立てにする",
+        "- 競合で薄い論点は独自性提案の候補として扱う",
+    ])
+    return "\n".join(lines)
+
+
 def step3_generate_outline(
     client: Any,
     llm_choice: str,
     keyword: str,
     serp_data: dict,
     run_dir: Path,
+    serp_analysis: str = "",
 ) -> str:
     sop_rules = load_prompt_file("sop.md")
     system_prompt = f"""
@@ -287,7 +355,10 @@ def step3_generate_outline(
 【対策キーワード】
 {keyword}
 
-【競合SERPデータ】
+【SERP横断分析】
+{serp_analysis}
+
+【競合SERP生データ】
 {build_serp_summary(serp_data)}
 
 出力はMarkdown形式とし、各H2には必ず [id: h2-01] の形式でIDを付与してください。
@@ -304,6 +375,7 @@ def step4_propose_originality(
     serp_data: dict,
     outline: str,
     run_dir: Path,
+    serp_analysis: str = "",
 ) -> list[dict[str, str]]:
     system_prompt = """
 あなたはSEO編集者です。競合SERPの見出しと現在の構成案を比較し、競合上位ページには含まれていない、または十分に扱われていない独自要素を3件だけ提案してください。
@@ -318,7 +390,10 @@ def step4_propose_originality(
     user_prompt = f"""
 対策キーワード: {keyword}
 
-競合SERP:
+SERP横断分析:
+{serp_analysis}
+
+競合SERP生データ:
 {build_serp_summary(serp_data)}
 
 現在の構成案:
@@ -345,6 +420,7 @@ def step5_generate_sections_and_assemble(
     outline: str,
     originality: dict[str, str],
     run_dir: Path,
+    serp_analysis: str = "",
 ) -> str:
     style_rules = load_prompt_file("writing-style.md")
     data_rules = load_prompt_file("data-integrity.md")
@@ -371,6 +447,9 @@ def step5_generate_sections_and_assemble(
 
 【データ整合性ルール】
 {data_rules}
+
+【SERP分析】
+{serp_analysis}
 
 【全体構成案】
 {outline}
