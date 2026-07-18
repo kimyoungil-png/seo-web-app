@@ -36,50 +36,63 @@ def get_model_config(llm_choice: str) -> dict[str, str]:
     return MODEL_OPTIONS[llm_choice]
 
 
-def get_llm_client(api_key: str, llm_choice: str):
-    config = get_model_config(llm_choice)
-    if config["provider"] == "gemini":
-        return genai.Client(api_key=api_key)
-    return OpenAI(api_key=api_key)
+class LLMService:
+    """選択された1つのAIプロバイダーだけを全AI工程で利用する共通サービス。"""
 
+    def __init__(self, api_key: str, llm_choice: str):
+        if not api_key:
+            raise ValueError("AI API Keyを入力してください。")
+        self.choice = llm_choice
+        self.config = get_model_config(llm_choice)
+        self.provider = self.config["provider"]
+        self.model = self.config["model"]
+        self.client = self._create_client(api_key)
 
-def generate_text(
-    client: Any,
-    llm_choice: str,
-    system_prompt: str,
-    user_prompt: str = "",
-    *,
-    use_web_search: bool = False,
-) -> str:
-    config = get_model_config(llm_choice)
-    model = config["model"]
+    def _create_client(self, api_key: str):
+        if self.provider == "gemini":
+            return genai.Client(api_key=api_key)
+        if self.provider == "openai":
+            return OpenAI(api_key=api_key)
+        raise ValueError(f"未対応のAIプロバイダーです: {self.provider}")
 
-    if config["provider"] == "gemini":
-        gemini_config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.7,
-            tools=[types.Tool(google_search=types.GoogleSearch())]
-            if use_web_search
-            else None,
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str = "",
+        *,
+        use_web_search: bool = False,
+    ) -> str:
+        """Outline / Originality / Article / Fact Checkの全処理が必ずこの入口を通る。"""
+        if self.provider == "gemini":
+            gemini_config = types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.7,
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+                if use_web_search
+                else None,
+            )
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=user_prompt or system_prompt,
+                config=gemini_config,
+            )
+            if not response.text:
+                raise RuntimeError("Geminiからテキスト応答を取得できませんでした。")
+            return response.text
+
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=system_prompt,
+            input=user_prompt or system_prompt,
+            tools=[{"type": "web_search"}] if use_web_search else [],
         )
-        response = client.models.generate_content(
-            model=model,
-            contents=user_prompt or system_prompt,
-            config=gemini_config,
-        )
-        if not response.text:
-            raise RuntimeError("Geminiからテキスト応答を取得できませんでした。")
-        return response.text
+        if not response.output_text:
+            raise RuntimeError("OpenAIからテキスト応答を取得できませんでした。")
+        return response.output_text
 
-    response = client.responses.create(
-        model=model,
-        instructions=system_prompt,
-        input=user_prompt or system_prompt,
-        tools=[{"type": "web_search"}] if use_web_search else [],
-    )
-    if not response.output_text:
-        raise RuntimeError("OpenAIからテキスト応答を取得できませんでした。")
-    return response.output_text
+
+def create_llm_service(api_key: str, llm_choice: str) -> LLMService:
+    return LLMService(api_key=api_key, llm_choice=llm_choice)
 
 
 def load_prompt_file(filename: str) -> str:
@@ -338,8 +351,7 @@ def analyze_serp(serp_data: dict) -> str:
 
 
 def step3_generate_outline(
-    client: Any,
-    llm_choice: str,
+    llm: LLMService,
     keyword: str,
     serp_data: dict,
     run_dir: Path,
@@ -363,30 +375,24 @@ def step3_generate_outline(
 
 出力はMarkdown形式とし、各H2には必ず [id: h2-01] の形式でIDを付与してください。
 """
-    outline = generate_text(client, llm_choice, system_prompt)
+    outline = llm.generate(system_prompt)
     (run_dir / "04-outline.md").write_text(outline, encoding="utf-8")
     return outline
 
 
 def step4_propose_originality(
-    client: Any,
-    llm_choice: str,
+    llm: LLMService,
     keyword: str,
     serp_data: dict,
     outline: str,
     run_dir: Path,
     serp_analysis: str = "",
 ) -> list[dict[str, str]]:
-    system_prompt = """
-あなたはSEO編集者です。競合SERPの見出しと現在の構成案を比較し、競合上位ページには含まれていない、または十分に扱われていない独自要素を3件だけ提案してください。
-
-条件:
-- 記事本文に実際に追加できる具体的な要素にする
-- 単なる言い換えや一般論は禁止
-- 根拠のない数値は提案しない
-- 各案に title、description、placement の3項目を含める
-- JSON配列だけを返す
-"""
+    system_prompt = load_prompt_file("originality-prompt.md")
+    if not system_prompt.strip():
+        raise FileNotFoundError(
+            "originality-prompt.mdが見つかりません。referencesに配置してください。"
+        )
     user_prompt = f"""
 対策キーワード: {keyword}
 
@@ -399,7 +405,7 @@ SERP横断分析:
 現在の構成案:
 {outline}
 """
-    raw = generate_text(client, llm_choice, system_prompt, user_prompt)
+    raw = llm.generate(system_prompt, user_prompt)
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if not match:
         raise RuntimeError("独自性提案をJSONとして解析できませんでした。")
@@ -414,16 +420,20 @@ SERP横断分析:
 
 
 def step5_generate_sections_and_assemble(
-    client: Any,
-    llm_choice: str,
+    llm: LLMService,
     keyword: str,
     outline: str,
     originality: dict[str, str],
     run_dir: Path,
     serp_analysis: str = "",
 ) -> str:
+    article_prompt = load_prompt_file("article-prompt.md")
     style_rules = load_prompt_file("writing-style.md")
     data_rules = load_prompt_file("data-integrity.md")
+    if not article_prompt.strip():
+        raise FileNotFoundError(
+            "article-prompt.mdが見つかりません。referencesに配置してください。"
+        )
 
     h2_matches = re.findall(r"##\s+(.*?)\s+\[id:\s*(h2-\d+)\]", outline)
     if not h2_matches:
@@ -440,7 +450,8 @@ def step5_generate_sections_and_assemble(
 
     for h2_title, h2_id in h2_matches:
         system_prompt = f"""
-あなたはプロのSEOライターです。指定されたH2セクションだけを執筆してください。
+【Article Generation専用指示】
+{article_prompt}
 
 【執筆スタイル規約】
 {style_rules}
@@ -456,11 +467,9 @@ def step5_generate_sections_and_assemble(
 
 【選択された独自要素】
 {originality_text}
-
-独自要素は最も自然なH2に一度だけ盛り込み、他のセクションでは重複させないでください。
 """
         user_prompt = f"H2見出し「{h2_title}」の本文のみを執筆してください。"
-        section = generate_text(client, llm_choice, system_prompt, user_prompt)
+        section = llm.generate(system_prompt, user_prompt)
         (drafts_dir / f"{h2_id}.md").write_text(section, encoding="utf-8")
         full_article += f"## {h2_title}\n{section}\n\n"
         time.sleep(1)
@@ -470,8 +479,7 @@ def step5_generate_sections_and_assemble(
 
 
 def step6_fact_check(
-    client: Any,
-    llm_choice: str,
+    llm: LLMService,
     article: str,
     run_dir: Path,
 ) -> str:
@@ -480,9 +488,7 @@ def step6_fact_check(
         raise FileNotFoundError(
             "factcheck-prompt.mdが見つかりません。アプリのルートまたはreferencesに配置してください。"
         )
-    report = generate_text(
-        client,
-        llm_choice,
+    report = llm.generate(
         factcheck_prompt,
         article,
         use_web_search=True,

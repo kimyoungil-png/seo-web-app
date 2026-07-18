@@ -6,7 +6,7 @@ import streamlit as st
 from backend import (
     MODEL_OPTIONS,
     analyze_serp,
-    get_llm_client,
+    create_llm_service,
     get_model_config,
     step2_fetch_serp_and_filter,
     step3_generate_outline,
@@ -65,6 +65,7 @@ DEFAULTS = {
     "fact_check": "",
     "run_dir": None,
     "active_keyword": "",
+    "active_llm_choice": "",
 }
 for key, default in DEFAULTS.items():
     st.session_state.setdefault(key, default)
@@ -112,11 +113,15 @@ with st.sidebar:
     st.subheader("AI Settings")
     llm_choice = st.selectbox("AI Model", list(MODEL_OPTIONS.keys()))
     model_config = get_model_config(llm_choice)
-    st.caption(f"Model ID: `{model_config['model']}`")
+    st.caption(f"Model ID: `{model_config['model']}` · All AI stages use this provider only")
     if model_config["provider"] == "gemini":
         api_key = st.text_input("Gemini API Key", value=secret("GEMINI_API_KEY"), type="password")
     else:
         api_key = st.text_input("OpenAI API Key", value=secret("OPENAI_API_KEY"), type="password")
+
+    if st.session_state.active_llm_choice and st.session_state.active_llm_choice != llm_choice:
+        reset_from("outline")
+    st.session_state.active_llm_choice = llm_choice
 
     st.divider()
     st.subheader("SERP API Settings")
@@ -227,10 +232,10 @@ with st.expander("3. Outline — 構成案の生成・編集", expanded=states[1
             if st.button("Generate Outline", type="primary", key="generate_outline"):
                 reset_from("outline")
                 try:
-                    client = get_llm_client(api_key, llm_choice)
+                    llm = create_llm_service(api_key, llm_choice)
                     with st.spinner("SERP分析とSERP生データを参照して構成案を生成しています..."):
                         st.session_state.outline = step3_generate_outline(
-                            client, llm_choice, keyword, st.session_state.serp_data, ensure_run_dir(), st.session_state.serp_analysis
+                            llm, keyword, st.session_state.serp_data, ensure_run_dir(), st.session_state.serp_analysis
                         )
                     st.rerun()
                 except Exception as exc:
@@ -249,10 +254,10 @@ with st.expander("4. Originality — 独自要素の提案・選択", expanded=s
         if st.button("Generate 3 Originality Ideas", type="primary", key="generate_originality"):
             reset_from("originality")
             try:
-                client = get_llm_client(api_key, llm_choice)
+                llm = create_llm_service(api_key, llm_choice)
                 with st.spinner("SERPにない、または競合で薄い独自要素を生成しています..."):
                     st.session_state.originality_proposals = step4_propose_originality(
-                        client, llm_choice, keyword, st.session_state.serp_data, st.session_state.outline,
+                        llm, keyword, st.session_state.serp_data, st.session_state.outline,
                         ensure_run_dir(), st.session_state.serp_analysis
                     )
                 st.rerun()
@@ -290,10 +295,10 @@ with st.expander("5. Article Generation — 記事生成・編集", expanded=sta
         if st.button("Generate Article", type="primary", key="generate_article"):
             reset_from("article")
             try:
-                client = get_llm_client(api_key, llm_choice)
+                llm = create_llm_service(api_key, llm_choice)
                 with st.spinner("構成案、SERP分析、独自要素を反映して記事を生成しています..."):
                     st.session_state.article = step5_generate_sections_and_assemble(
-                        client, llm_choice, keyword, st.session_state.outline, st.session_state.selected_originality,
+                        llm, keyword, st.session_state.outline, st.session_state.selected_originality,
                         ensure_run_dir(), st.session_state.serp_analysis
                     )
                 st.rerun()
@@ -314,10 +319,10 @@ with st.expander("6. Fact Check — ファクトチェック", expanded=states[4
         if st.button("Run Fact Check", type="primary", key="run_fact_check"):
             reset_from("fact")
             try:
-                client = get_llm_client(api_key, llm_choice)
+                llm = create_llm_service(api_key, llm_choice)
                 with st.spinner("記事全体を調査・検証しています..."):
                     st.session_state.fact_check = step6_fact_check(
-                        client, llm_choice, st.session_state.article, ensure_run_dir()
+                        llm, st.session_state.article, ensure_run_dir()
                     )
                 st.rerun()
             except Exception as exc:
