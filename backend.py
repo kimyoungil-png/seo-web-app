@@ -145,6 +145,80 @@ def _extract_page_details(rank: int, item: dict[str, Any], timeout: float = 15.0
     return result
 
 
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("results", "items", "data"):
+            if isinstance(value.get(key), list):
+                return value[key]
+        return [value]
+    return []
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return re.sub(r"<[^>]+>", "", str(value)).strip()
+
+
+def _first_value(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return ""
+
+
+def _normalize_result_items(section: Any, category: str) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(_as_list(section), 1):
+        if not isinstance(raw, dict):
+            raw = {"text": raw}
+        title = _clean_text(_first_value(raw, "title", "question", "name", "query"))
+        description = _clean_text(
+            _first_value(raw, "description", "answer", "snippet", "text", "long_desc")
+        )
+        url = _clean_text(_first_value(raw, "url", "link", "source_url"))
+        source = _clean_text(
+            _first_value(raw, "source", "profile", "forum_name", "publisher", "site_name")
+        )
+        age = _clean_text(_first_value(raw, "age", "page_age", "published", "date"))
+        item = {
+            "rank": index,
+            "category": category,
+            "title": title,
+            "url": url,
+            "snippet": description,
+            "source": source,
+            "age": age,
+            "raw": raw,
+        }
+        if category == "faq":
+            item["question"] = title
+            item["answer"] = description
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_infobox(section: Any) -> dict[str, Any]:
+    if not isinstance(section, dict):
+        return {}
+    return {
+        "title": _clean_text(_first_value(section, "title", "label", "name")),
+        "description": _clean_text(
+            _first_value(section, "description", "long_desc", "summary", "subtype")
+        ),
+        "url": _clean_text(_first_value(section, "url", "source_url")),
+        "attributes": section.get("attributes") or section.get("data") or [],
+        "raw": section,
+    }
+
+
 def _search_brave(
     keyword: str,
     api_key: str,
@@ -153,8 +227,8 @@ def _search_brave(
     country: str,
     search_lang: str,
     ui_lang: str,
-) -> list[dict[str, Any]]:
-    """Brave Web Search APIから通常のWeb検索結果を取得する。"""
+) -> dict[str, Any]:
+    """Brave Web Search APIからWeb・Discussions・FAQ・News・Videos・Entityを一括取得する。"""
     if not api_key:
         raise ValueError("Brave Search API Keyを入力してください。")
 
@@ -179,60 +253,28 @@ def _search_brave(
         "safesearch": "moderate",
         "spellcheck": "true",
         "text_decorations": "false",
-        "result_filter": "web",
+        "extra_snippets": "true",
+        "result_filter": "web,discussions,faq,news,videos,infobox",
     }
 
     response = httpx.get(url, headers=headers, params=params, timeout=30.0)
-
-    # Handle common error statuses with clearer messages
-    if response.status_code == 401:
-        raise RuntimeError("Brave Search APIキーが無効です。")
-    if response.status_code == 403:
-        raise RuntimeError("Brave Search APIの利用権限または契約プランを確認してください。")
-    if response.status_code == 429:
-        raise RuntimeError("Brave Search APIのレート制限に達しました。しばらく待って再実行してください。")
-
-    # Special handling for 422 Unprocessable Entity: try a shorter ui_lang (e.g. 'ja' from 'ja-JP')
-    if response.status_code == 422:
-        try:
-            short_ui = ui_lang.split("-")[0]
-            if short_ui and short_ui != ui_lang:
-                params["ui_lang"] = short_ui
-                retry_resp = httpx.get(url, headers=headers, params=params, timeout=30.0)
-                if retry_resp.status_code == 200:
-                    data = retry_resp.json()
-                    web_results = (data.get("web") or {}).get("results") or []
-                    return [
-                        {
-                            "url": row.get("url", ""),
-                            "title": row.get("title"),
-                            "snippet": row.get("description", ""),
-                        }
-                        for row in web_results[:top_n]
-                        if row.get("url")
-                    ]
-                # fall through to raise below
-        except Exception:
-            pass
-        # include response body for debugging
+    if response.status_code != 200:
         raise RuntimeError(
-            f"Brave Search API returned 422 Unprocessable Entity. Response body: {response.text}"
+            f"Brave Search API error {response.status_code}: {response.text}"
         )
 
-    # For other non-success statuses, raise generic
-    response.raise_for_status()
-
     data = response.json()
-    web_results = (data.get("web") or {}).get("results") or []
-    return [
-        {
-            "url": row.get("url", ""),
-            "title": row.get("title"),
-            "snippet": row.get("description", ""),
-        }
-        for row in web_results[:top_n]
-        if row.get("url")
-    ]
+    web_items = _normalize_result_items(data.get("web"), "web")[:top_n]
+    return {
+        "web": web_items,
+        "discussions": _normalize_result_items(data.get("discussions"), "discussions"),
+        "faq": _normalize_result_items(data.get("faq"), "faq"),
+        "news": _normalize_result_items(data.get("news"), "news"),
+        "videos": _normalize_result_items(data.get("videos"), "videos"),
+        "entity": _normalize_infobox(data.get("infobox")),
+        "query": data.get("query") or {},
+        "raw_response": data,
+    }
 
 def step2_fetch_serp_and_filter(
     keyword: str,
@@ -243,21 +285,21 @@ def step2_fetch_serp_and_filter(
     credentials: dict[str, str],
     top_n: int = 8,
 ) -> dict:
-    """外部SERP APIで順位URLを取得し、各URLの見出しを安全に抽出する。"""
-    if provider == "brave":
-        candidates = _search_brave(
-            keyword,
-            credentials.get("api_key", ""),
-            top_n,
-            country=credentials.get("country", "JP"),
-            search_lang=credentials.get("search_lang", "ja"),
-            ui_lang=credentials.get("ui_lang", "ja-JP"),
-        )
-    else:
+    """Braveの複数SERPタイプを取得し、Web結果のみH2/H3を抽出する。"""
+    if provider != "brave":
         raise ValueError(f"未対応のSERPプロバイダーです: {provider}")
 
+    brave_data = _search_brave(
+        keyword,
+        credentials.get("api_key", ""),
+        top_n,
+        country=credentials.get("country", "JP"),
+        search_lang=credentials.get("search_lang", "jp"),
+        ui_lang=credentials.get("ui_lang", "ja-JP"),
+    )
+    candidates = brave_data.get("web", [])
     if not candidates:
-        raise RuntimeError("SERP APIからオーガニック検索結果を取得できませんでした。")
+        raise RuntimeError("Brave Search APIからWeb検索結果を取得できませんでした。")
 
     raw_results = [_extract_page_details(rank, item) for rank, item in enumerate(candidates, 1)]
     valid_results = [
@@ -272,15 +314,27 @@ def step2_fetch_serp_and_filter(
         "provider": provider,
         "search_settings": {
             "country": credentials.get("country", "JP"),
-            "search_lang": credentials.get("search_lang", "ja"),
+            "search_lang": credentials.get("search_lang", "jp"),
             "ui_lang": credentials.get("ui_lang", "ja-JP"),
         },
         "results": valid_results,
+        "web": valid_results,
+        "discussions": brave_data.get("discussions", []),
+        "faq": brave_data.get("faq", []),
+        "news": brave_data.get("news", []),
+        "videos": brave_data.get("videos", []),
+        "entity": brave_data.get("entity", {}),
+        "query": brave_data.get("query", {}),
         "diagnostics": {
-            "raw_count": len(raw_results),
-            "valid_count": len(valid_results),
-            "failed_count": sum(bool(r.get("fetch_error")) for r in raw_results),
-            "blocked_count": sum(bool(r.get("blocked_count", 0)) for r in raw_results),
+            "raw_web_count": len(raw_results),
+            "valid_web_count": len(valid_results),
+            "failed_web_count": sum(bool(r.get("fetch_error")) for r in raw_results),
+            "blocked_web_count": sum(bool(r.get("blocked_count", 0)) for r in raw_results),
+            "discussions_count": len(brave_data.get("discussions", [])),
+            "faq_count": len(brave_data.get("faq", [])),
+            "news_count": len(brave_data.get("news", [])),
+            "videos_count": len(brave_data.get("videos", [])),
+            "entity_available": bool(brave_data.get("entity")),
         },
     }
     (run_dir / "03-serp.json").write_text(
@@ -289,15 +343,25 @@ def step2_fetch_serp_and_filter(
 
     if not valid_results:
         raise RuntimeError(
-            "順位URLは取得できましたが、本文の見出しを取得できるページがありませんでした。"
+            "Web順位URLは取得できましたが、本文の見出しを取得できるページがありませんでした。"
             "対象サイト側のアクセス制限を確認してください。"
         )
     return serp_data
 
+def _category_lines(items: list[dict[str, Any]], limit: int = 12) -> list[str]:
+    lines: list[str] = []
+    for item in items[:limit]:
+        title = item.get("title") or item.get("question") or "(タイトルなし)"
+        snippet = item.get("snippet") or item.get("answer") or ""
+        url = item.get("url") or ""
+        lines.append(f"- {title}\n  - 概要: {snippet}\n  - URL: {url}")
+    return lines or ["- 該当結果なし"]
+
 
 def build_serp_summary(serp_data: dict) -> str:
-    lines = []
-    for result in serp_data.get("results", []):
+    lines = ["# Brave SERP Research"]
+    lines.extend(["", "## Web：競合分析・構成"])
+    for result in serp_data.get("web", serp_data.get("results", [])):
         headings = result.get("headings", {})
         lines.append(
             "\n".join(
@@ -305,17 +369,36 @@ def build_serp_summary(serp_data: dict) -> str:
                     f"順位: {result.get('rank')}",
                     f"タイトル: {result.get('title') or '(タイトルなし)'}",
                     f"URL: {result.get('url')}",
+                    f"概要: {result.get('snippet', '')}",
                     f"H2: {json.dumps(headings.get('h2', []), ensure_ascii=False)}",
                     f"H3: {json.dumps(headings.get('h3', []), ensure_ascii=False)}",
                 ]
             )
         )
-    return "\n\n".join(lines)
-
+    lines.extend(["", "## Discussions：ユーザーの本音・Pain Point"])
+    lines.extend(_category_lines(serp_data.get("discussions", [])))
+    lines.extend(["", "## FAQ：知りたいこと・Question一覧"])
+    lines.extend(_category_lines(serp_data.get("faq", [])))
+    lines.extend(["", "## News：鮮度・更新性・最新情報・変更点"])
+    lines.extend(_category_lines(serp_data.get("news", [])))
+    lines.extend(["", "## Videos：体験・理解促進・手順・比較・実演"])
+    lines.extend(_category_lines(serp_data.get("videos", [])))
+    entity = serp_data.get("entity") or {}
+    lines.extend(["", "## Entity：検索対象の実体情報"])
+    if entity:
+        lines.extend([
+            f"- 名称: {entity.get('title', '')}",
+            f"- 説明: {entity.get('description', '')}",
+            f"- URL: {entity.get('url', '')}",
+            f"- 属性: {json.dumps(entity.get('attributes', []), ensure_ascii=False)}",
+        ])
+    else:
+        lines.append("- 該当結果なし")
+    return "\n".join(lines)
 
 def analyze_serp(serp_data: dict) -> str:
-    """SERP全体の頻出見出しと検索意図の手掛かりを簡潔にまとめる。"""
-    results = serp_data.get("results", [])
+    """Braveの各SERPタイプをSEO記事制作の役割別に整理する。"""
+    results = serp_data.get("web", serp_data.get("results", []))
     h2_counter: Counter[str] = Counter()
     h3_counter: Counter[str] = Counter()
     for result in results:
@@ -329,26 +412,59 @@ def analyze_serp(serp_data: dict) -> str:
             if normalized:
                 h3_counter[normalized] += 1
 
-    lines = [f"### SERP分析（取得 {len(results)}件）", "", "#### 頻出H2"]
-    if h2_counter:
-        lines.extend([f"- {title}（{count}ページ）" for title, count in h2_counter.most_common(12)])
-    else:
-        lines.append("- 抽出できませんでした")
+    lines = [
+        f"### Web：競合分析・構成（取得 {len(results)}件）",
+        "",
+        "#### 頻出H2",
+    ]
+    lines.extend(
+        [f"- {title}（{count}ページ）" for title, count in h2_counter.most_common(12)]
+        or ["- 抽出できませんでした"]
+    )
     lines.extend(["", "#### 頻出H3"])
-    if h3_counter:
-        lines.extend([f"- {title}（{count}ページ）" for title, count in h3_counter.most_common(15)])
+    lines.extend(
+        [f"- {title}（{count}ページ）" for title, count in h3_counter.most_common(15)]
+        or ["- 抽出できませんでした"]
+    )
+
+    categories = [
+        ("Discussions：ユーザーの本音・Pain Point", "discussions"),
+        ("FAQ：知りたいこと・Question一覧", "faq"),
+        ("News：鮮度・更新性・最新情報・変更点", "news"),
+        ("Videos：体験・理解促進・手順・比較・実演", "videos"),
+    ]
+    for heading, key in categories:
+        items = serp_data.get(key, [])
+        lines.extend(["", f"### {heading}（取得 {len(items)}件）"])
+        if items:
+            for item in items[:10]:
+                title = item.get("title") or item.get("question") or "(タイトルなし)"
+                snippet = item.get("snippet") or item.get("answer") or ""
+                lines.append(f"- **{title}**：{snippet}")
+        else:
+            lines.append("- 該当結果なし")
+
+    entity = serp_data.get("entity") or {}
+    lines.extend(["", "### Entity：検索対象の実体情報"])
+    if entity:
+        lines.append(f"- **{entity.get('title', '')}**：{entity.get('description', '')}")
+        attrs = entity.get("attributes") or []
+        if attrs:
+            lines.append(f"- 属性：{json.dumps(attrs, ensure_ascii=False)}")
     else:
-        lines.append("- 抽出できませんでした")
+        lines.append("- 該当結果なし")
+
     lines.extend([
         "",
-        "#### 構成作成時の判断基準",
-        "- 複数ページで共通する論点は検索意図の中核として優先する",
-        "- 単一ページだけの見出しは必要性を検討し、網羅性のために機械的には追加しない",
-        "- タイトル・スニペット・H2・H3を照合し、重複をまとめて自然な章立てにする",
-        "- 競合で薄い論点は独自性提案の候補として扱う",
+        "### 構成作成時の判断基準",
+        "- Webの共通論点を検索意図の中核として構成に反映する",
+        "- Discussionsから悩み・不満・障壁・生の表現を抽出する",
+        "- FAQを見出し候補と記事末尾の質問候補に利用する",
+        "- Newsから更新日、制度変更、製品変更など鮮度が必要な論点を確認する",
+        "- Videosから手順、比較、実演、視覚説明が有効な箇所を特定する",
+        "- Entityで名称、属性、関連概念の一貫性を確認する",
     ])
     return "\n".join(lines)
-
 
 def step3_generate_outline(
     llm: LLMService,

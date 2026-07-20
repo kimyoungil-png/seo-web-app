@@ -9,6 +9,32 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Workflow
+
+All stages appear on one page. Completed stages are collapsed and can be reopened. A completed action button changes from blue to gray while remaining available for regeneration.
+
+1. Setup
+2. SERP Research
+3. Outline
+4. Originality
+5. Article Generation
+6. Fact Check
+
+The Outline editor is shown below the SERP analysis at full page width.
+
+## Brave SERP data
+
+A single Brave Web Search request asks for all available result types:
+
+- `web`: competitor analysis and outline planning
+- `discussions`: user voice and pain points
+- `faq`: question list and information needs
+- `news`: freshness, changes, and recent developments
+- `videos`: procedures, comparisons, demonstrations, and visual explanations
+- `infobox`: normalized in the app as `entity`
+
+Brave may omit a result type when it has no relevant data or when the subscribed plan does not include that response option.
+
 ## AI provider behavior
 
 Select either Gemini or OpenAI in **AI Settings**. The selected provider and model are used consistently for every AI stage:
@@ -22,24 +48,13 @@ Changing the AI model clears downstream AI-generated outputs so providers are no
 
 ## AI prompt files
 
-The AI instructions for each generation stage are stored separately under `references/`.
+- `references/originality-prompt.md`
+- `references/article-prompt.md`
+- `references/factcheck-prompt.md`
+- `references/writing-style.md`
+- `references/sop.md`
+- `references/data-integrity.md`
 
-- `originality-prompt.md`: Stage 4 Originality
-- `article-prompt.md`: Stage 5 Article Generation
-- `factcheck-prompt.md`: Stage 6 Fact Check
+## State management
 
-You can tune these stages without editing Python code. The application reads each file at runtime.
-
-## State management and cache policy
-
-This application does not use `@st.cache_data`, `@st.cache_resource`, `st.cache_data`, or `st.cache_resource`.
-
-Workflow results are stored only in `st.session_state`:
-
-- SERP results and analysis
-- Outline and manual edits
-- Originality proposals and selection
-- Generated article and manual edits
-- Fact-check report
-
-Changing the keyword or AI model resets downstream results so that outputs from different settings are not mixed. The Streamlit toolbar is set to `minimal` in `.streamlit/config.toml`, reducing access to development-only cache controls while preserving full API error details.
+The application does not use `@st.cache_data`, `@st.cache_resource`, `st.cache_data`, or `st.cache_resource`. Workflow results are stored in `st.session_state` only.

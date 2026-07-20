@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -27,10 +28,12 @@ st.markdown(
   --line:#dce7f5;
   --text:#172033;
   --muted:#61758e;
+  --done:#e6e9ee;
+  --done-text:#5f6875;
 }
 html, body, [class*="css"], .stApp, .stApp * { font-size:12px !important; }
 .stApp { background:#ffffff; color:var(--text); }
-.block-container { max-width:1280px; padding-top:1.2rem; padding-bottom:4rem; }
+.block-container { max-width:1380px; padding-top:1.2rem; padding-bottom:4rem; }
 h1 { font-size:24px !important; color:#0b3d7a; margin-bottom:2px !important; }
 h2 { font-size:17px !important; color:#124f9c; }
 h3 { font-size:14px !important; color:#124f9c; }
@@ -39,23 +42,24 @@ p, label, span, div, button, input, textarea, select { font-size:12px !important
 [data-testid="stExpander"] { border:1px solid var(--line); border-radius:12px; background:#ffffff; margin-bottom:12px; overflow:hidden; }
 [data-testid="stExpander"] summary { background:#f8fbff; color:#123f73; font-weight:700; padding:12px 14px; }
 [data-testid="stExpander"] summary:hover { color:var(--blue); }
-.stButton > button, .stDownloadButton > button { border-radius:8px; border:1px solid var(--blue); min-height:36px; font-weight:700; }
-.stButton > button[kind="primary"] { background:var(--blue); color:white; }
+.stButton > button, .stDownloadButton > button { border-radius:8px; min-height:36px; font-weight:700; }
+.stButton > button[kind="primary"] { background:var(--blue); border:1px solid var(--blue); color:white; }
 .stButton > button[kind="primary"]:hover { background:var(--blue-dark); }
+.stButton > button[kind="secondary"] { background:var(--done); border:1px solid #cdd3dc; color:var(--done-text); }
+.stButton > button[kind="secondary"]:hover { background:#dce0e6; border-color:#b9c0ca; color:#404854; }
 .section-note { background:var(--blue-soft); border-left:4px solid var(--blue); border-radius:8px; padding:10px 12px; margin-bottom:10px; }
 .status-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:4px 0 14px; }
 .status-pill { border:1px solid var(--line); border-radius:999px; padding:5px 10px; color:var(--muted); background:#fff; font-weight:700; }
-.status-pill.done { color:#0b4fa8; background:#eef5ff; border-color:#bcd4f5; }
+.status-pill.done { color:#56606d; background:#e6e9ee; border-color:#cfd5dd; }
 .status-pill.current { color:#fff; background:var(--blue); border-color:var(--blue); }
 div[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+.serp-purpose { color:var(--muted); margin:-4px 0 10px; }
 </style>
 ''',
     unsafe_allow_html=True,
 )
 
-# This workflow intentionally uses only st.session_state.
-# Do not add @st.cache_data or @st.cache_resource to SERP or AI generation.
-# API responses and editable outputs must remain scoped to the current browser session.
+# The workflow uses st.session_state only. Do not add Streamlit function caches.
 STAGES = ["Setup", "SERP Research", "Outline", "Originality", "Article Generation", "Fact Check"]
 DEFAULTS = {
     "serp_data": None,
@@ -93,11 +97,17 @@ def reset_from(stage: str) -> None:
     for item in order[order.index(stage):]:
         for key in mapping[item]:
             st.session_state[key] = DEFAULTS[key]
+    for widget_key in ("outline_editor", "article_editor", "originality_choice_widget"):
+        if widget_key in st.session_state:
+            del st.session_state[widget_key]
 
 
 def reset_all() -> None:
     for key, default in DEFAULTS.items():
         st.session_state[key] = default
+    for widget_key in ("outline_editor", "article_editor", "originality_choice_widget"):
+        if widget_key in st.session_state:
+            del st.session_state[widget_key]
 
 
 def ensure_run_dir() -> Path:
@@ -109,8 +119,33 @@ def ensure_run_dir() -> Path:
     return st.session_state.run_dir
 
 
+def action_button(label: str, key: str, completed: bool) -> bool:
+    """Completed stage buttons remain usable but switch to gray secondary styling."""
+    return st.button(label, type="secondary" if completed else "primary", key=key)
+
+
+def rows_for(items: list[dict[str, Any]], *, faq: bool = False) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if faq:
+            rows.append({
+                "Question": item.get("question") or item.get("title", ""),
+                "Answer": item.get("answer") or item.get("snippet", ""),
+                "URL": item.get("url", ""),
+            })
+        else:
+            rows.append({
+                "Title": item.get("title", ""),
+                "Snippet": item.get("snippet", ""),
+                "Source": item.get("source", ""),
+                "Date/Age": item.get("age", ""),
+                "URL": item.get("url", ""),
+            })
+    return rows
+
+
 st.title("SEO Article Generator")
-st.caption("Complete each section from top to bottom. Finished sections close automatically and can be reopened at any time.")
+st.caption("All stages stay on one page. Completed stages close automatically and can be reopened.")
 
 with st.sidebar:
     st.subheader("AI Settings")
@@ -135,7 +170,7 @@ with st.sidebar:
         "United States": {"country": "US", "search_lang": "en", "ui_lang": "en-US"},
     }
     selected_country_label = st.selectbox("Country", list(country_options.keys()))
-    result_count = st.selectbox("Result Count", [5, 8, 10, 15, 20], index=1)
+    result_count = st.selectbox("Web Result Count", [5, 8, 10, 15, 20], index=1)
     country_config = country_options[selected_country_label]
     serp_credentials = {"api_key": brave_api_key, **country_config}
     st.caption(f"Language is linked automatically: `{country_config['search_lang']}`")
@@ -172,7 +207,7 @@ with st.expander("1. Setup — 基本設定", expanded=not states[0]):
     c1, c2, c3 = st.columns(3)
     c1.metric("AI Model", llm_choice)
     c2.metric("Country", selected_country_label)
-    c3.metric("SERP Results", result_count)
+    c3.metric("Web Results", result_count)
     missing = []
     if not keyword:
         missing.append("Target Keyword")
@@ -185,83 +220,129 @@ with st.expander("1. Setup — 基本設定", expanded=not states[0]):
     else:
         st.success("Setup is complete. Continue to SERP Research below.")
 
-with st.expander("2. SERP Research — 競合SERPの取得・分析", expanded=states[0] and not states[1]):
+with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", expanded=states[0] and not states[1]):
     if not states[0]:
         st.info("Complete Setup first.")
     else:
-        if st.button("Run SERP Research", type="primary", key="run_serp"):
+        if action_button("Run SERP Research", "run_serp", states[1]):
             reset_from("serp")
             run_dir = ensure_run_dir()
             try:
-                with st.spinner("Brave Search APIからSERPを取得し、各ページのH2・H3を分析しています..."):
+                with st.spinner("Brave Search APIからWeb、Discussions、FAQ、News、Videos、Entityを取得しています..."):
                     st.session_state.serp_data = step2_fetch_serp_and_filter(
-                        keyword, run_dir.name, run_dir, provider="brave", credentials=serp_credentials, top_n=result_count
+                        keyword,
+                        run_dir.name,
+                        run_dir,
+                        provider="brave",
+                        credentials=serp_credentials,
+                        top_n=result_count,
                     )
                     st.session_state.serp_analysis = analyze_serp(st.session_state.serp_data)
                 st.rerun()
             except Exception as exc:
                 st.error(f"SERP Research error: {exc}")
+
         if st.session_state.serp_data:
-            rows = []
-            for result in st.session_state.serp_data.get("results", []):
-                headings = result.get("headings", {})
-                rows.append({
-                    "Rank": result.get("rank"),
-                    "Title": result.get("title"),
-                    "URL": result.get("url"),
-                    "Snippet": result.get("snippet", ""),
-                    "H2": len(headings.get("h2", [])),
-                    "H3": len(headings.get("h3", [])),
-                })
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-            st.markdown(st.session_state.serp_analysis or "")
-            with st.expander("View Page Headings", expanded=False):
-                for result in st.session_state.serp_data.get("results", []):
-                    st.markdown(f"**{result.get('rank')}. {result.get('title') or result.get('url')}**")
-                    st.write("H2:", result.get("headings", {}).get("h2", []))
-                    st.write("H3:", result.get("headings", {}).get("h3", []))
-                    st.divider()
+            data = st.session_state.serp_data
+            tabs = st.tabs(["Web", "Discussions", "FAQ", "News", "Videos", "Entity", "Analysis"])
+            with tabs[0]:
+                st.markdown("<div class='serp-purpose'>競合分析・記事構成に利用</div>", unsafe_allow_html=True)
+                web_rows = []
+                for result in data.get("web", data.get("results", [])):
+                    headings = result.get("headings", {})
+                    web_rows.append({
+                        "Rank": result.get("rank"),
+                        "Title": result.get("title"),
+                        "Snippet": result.get("snippet", ""),
+                        "H2": len(headings.get("h2", [])),
+                        "H3": len(headings.get("h3", [])),
+                        "URL": result.get("url"),
+                    })
+                st.dataframe(web_rows, use_container_width=True, hide_index=True)
+                with st.expander("View Page Headings", expanded=False):
+                    for result in data.get("web", data.get("results", [])):
+                        st.markdown(f"**{result.get('rank')}. {result.get('title') or result.get('url')}**")
+                        st.write("H2:", result.get("headings", {}).get("h2", []))
+                        st.write("H3:", result.get("headings", {}).get("h3", []))
+                        st.divider()
+            with tabs[1]:
+                st.markdown("<div class='serp-purpose'>ユーザーの本音・Pain Pointの抽出に利用</div>", unsafe_allow_html=True)
+                st.dataframe(rows_for(data.get("discussions", [])), use_container_width=True, hide_index=True)
+            with tabs[2]:
+                st.markdown("<div class='serp-purpose'>知りたいこと・Question一覧として利用</div>", unsafe_allow_html=True)
+                st.dataframe(rows_for(data.get("faq", []), faq=True), use_container_width=True, hide_index=True)
+            with tabs[3]:
+                st.markdown("<div class='serp-purpose'>鮮度・更新性・最新情報・変更点の確認に利用</div>", unsafe_allow_html=True)
+                st.dataframe(rows_for(data.get("news", [])), use_container_width=True, hide_index=True)
+            with tabs[4]:
+                st.markdown("<div class='serp-purpose'>体験・理解促進・手順・比較・実演の把握に利用</div>", unsafe_allow_html=True)
+                st.dataframe(rows_for(data.get("videos", [])), use_container_width=True, hide_index=True)
+            with tabs[5]:
+                st.markdown("<div class='serp-purpose'>Entity名、説明、属性の確認に利用（Brave APIのinfoboxをEntityとして整理）</div>", unsafe_allow_html=True)
+                entity = data.get("entity") or {}
+                if entity:
+                    st.markdown(f"### {entity.get('title') or 'Entity'}")
+                    st.write(entity.get("description", ""))
+                    if entity.get("url"):
+                        st.write(entity.get("url"))
+                    if entity.get("attributes"):
+                        st.json(entity.get("attributes"))
+                else:
+                    st.info("Entity result was not returned for this query.")
+            with tabs[6]:
+                st.markdown(st.session_state.serp_analysis or "")
 
 with st.expander("3. Outline — 構成案の生成・編集", expanded=states[1] and not states[2]):
     if not states[1]:
         st.info("Complete SERP Research first.")
     else:
-        left, right = st.columns([0.4, 0.6], gap="large")
-        with left:
-            st.subheader("SERP Analysis")
-            st.markdown(st.session_state.serp_analysis or "分析結果がありません。")
-        with right:
-            st.subheader("Outline Editor")
-            if st.button("Generate Outline", type="primary", key="generate_outline"):
-                reset_from("outline")
-                try:
-                    llm = create_llm_service(api_key, llm_choice)
-                    with st.spinner("SERP分析とSERP生データを参照して構成案を生成しています..."):
-                        st.session_state.outline = step3_generate_outline(
-                            llm, keyword, st.session_state.serp_data, ensure_run_dir(), st.session_state.serp_analysis
-                        )
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Outline generation error: {exc}")
-            if st.session_state.outline:
-                edited_outline = st.text_area("Outline", value=st.session_state.outline, height=520, key="outline_editor")
-                if edited_outline != st.session_state.outline:
-                    st.session_state.outline = edited_outline
-                    reset_from("originality")
-                st.success("Outline is ready. Continue to Originality below.")
+        st.subheader("SERP Analysis")
+        st.markdown(st.session_state.serp_analysis or "分析結果がありません。")
+        st.divider()
+        st.subheader("Outline Editor")
+        if action_button("Generate Outline", "generate_outline", states[2]):
+            reset_from("outline")
+            try:
+                llm = create_llm_service(api_key, llm_choice)
+                with st.spinner("すべてのSERPタイプを参照して構成案を生成しています..."):
+                    st.session_state.outline = step3_generate_outline(
+                        llm,
+                        keyword,
+                        st.session_state.serp_data,
+                        ensure_run_dir(),
+                        st.session_state.serp_analysis,
+                    )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Outline generation error: {exc}")
+        if st.session_state.outline:
+            edited_outline = st.text_area(
+                "Outline",
+                value=st.session_state.outline,
+                height=560,
+                key="outline_editor",
+            )
+            if edited_outline != st.session_state.outline:
+                st.session_state.outline = edited_outline
+                reset_from("originality")
+            st.success("Outline is ready. Continue to Originality below.")
 
 with st.expander("4. Originality — 独自要素の提案・選択", expanded=states[2] and not states[3]):
     if not states[2]:
         st.info("Complete Outline first.")
     else:
-        if st.button("Generate 3 Originality Ideas", type="primary", key="generate_originality"):
+        if action_button("Generate 3 Originality Ideas", "generate_originality", bool(st.session_state.originality_proposals)):
             reset_from("originality")
             try:
                 llm = create_llm_service(api_key, llm_choice)
                 with st.spinner("SERPにない、または競合で薄い独自要素を生成しています..."):
                     st.session_state.originality_proposals = step4_propose_originality(
-                        llm, keyword, st.session_state.serp_data, st.session_state.outline,
-                        ensure_run_dir(), st.session_state.serp_analysis
+                        llm,
+                        keyword,
+                        st.session_state.serp_data,
+                        st.session_state.outline,
+                        ensure_run_dir(),
+                        st.session_state.serp_analysis,
                     )
                 st.rerun()
             except Exception as exc:
@@ -283,7 +364,7 @@ with st.expander("4. Originality — 独自要素の提案・選択", expanded=s
                 horizontal=True,
                 key="originality_choice_widget",
             )
-            if st.button("Confirm Originality", type="primary", key="confirm_originality"):
+            if action_button("Confirm Originality", "confirm_originality", states[3]):
                 st.session_state.originality_choice = selected_index
                 st.session_state.selected_originality = proposals[selected_index]
                 reset_from("article")
@@ -295,14 +376,18 @@ with st.expander("5. Article Generation — 記事生成・編集", expanded=sta
     if not states[3]:
         st.info("Confirm an Originality idea first.")
     else:
-        if st.button("Generate Article", type="primary", key="generate_article"):
+        if action_button("Generate Article", "generate_article", states[4]):
             reset_from("article")
             try:
                 llm = create_llm_service(api_key, llm_choice)
                 with st.spinner("構成案、SERP分析、独自要素を反映して記事を生成しています..."):
                     st.session_state.article = step5_generate_sections_and_assemble(
-                        llm, keyword, st.session_state.outline, st.session_state.selected_originality,
-                        ensure_run_dir(), st.session_state.serp_analysis
+                        llm,
+                        keyword,
+                        st.session_state.outline,
+                        st.session_state.selected_originality,
+                        ensure_run_dir(),
+                        st.session_state.serp_analysis,
                     )
                 st.rerun()
             except Exception as exc:
@@ -319,7 +404,7 @@ with st.expander("6. Fact Check — ファクトチェック", expanded=states[4
         st.info("Complete Article Generation first.")
     else:
         st.caption("references/factcheck-prompt.mdを読み込み、選択中のAIのWeb検索機能で記事を検証します。")
-        if st.button("Run Fact Check", type="primary", key="run_fact_check"):
+        if action_button("Run Fact Check", "run_fact_check", states[5]):
             reset_from("fact")
             try:
                 llm = create_llm_service(api_key, llm_choice)
@@ -333,6 +418,9 @@ with st.expander("6. Fact Check — ファクトチェック", expanded=states[4
         if st.session_state.fact_check:
             st.markdown(st.session_state.fact_check)
             st.download_button(
-                "Download Fact Check", st.session_state.fact_check, file_name="fact-check.md", mime="text/markdown"
+                "Download Fact Check",
+                st.session_state.fact_check,
+                file_name="fact-check.md",
+                mime="text/markdown",
             )
             st.success("All stages are complete.")
