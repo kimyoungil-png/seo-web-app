@@ -29,3 +29,17 @@ The AI instructions for each generation stage are stored separately under `refer
 - `factcheck-prompt.md`: Stage 6 Fact Check
 
 You can tune these stages without editing Python code. The application reads each file at runtime.
+
+## State management and cache policy
+
+This application does not use `@st.cache_data`, `@st.cache_resource`, `st.cache_data`, or `st.cache_resource`.
+
+Workflow results are stored only in `st.session_state`:
+
+- SERP results and analysis
+- Outline and manual edits
+- Originality proposals and selection
+- Generated article and manual edits
+- Fact-check report
+
+Changing the keyword or AI model resets downstream results so that outputs from different settings are not mixed. The Streamlit toolbar is set to `minimal` in `.streamlit/config.toml`, reducing access to development-only cache controls while preserving full API error details.

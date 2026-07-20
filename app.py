@@ -53,6 +53,9 @@ div[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10p
     unsafe_allow_html=True,
 )
 
+# This workflow intentionally uses only st.session_state.
+# Do not add @st.cache_data or @st.cache_resource to SERP or AI generation.
+# API responses and editable outputs must remain scoped to the current browser session.
 STAGES = ["Setup", "SERP Research", "Outline", "Originality", "Article Generation", "Fact Check"]
 DEFAULTS = {
     "serp_data": None,

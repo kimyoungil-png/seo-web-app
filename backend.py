@@ -30,7 +30,7 @@ MODEL_OPTIONS = {
 }
 
 
-def get_model_config(llm_choice: str) -> Dict[str, str]:
+def get_model_config(llm_choice: str) -> dict[str, str]:
     if llm_choice not in MODEL_OPTIONS:
         raise ValueError(f"未対応のモデルです: {llm_choice}")
     return MODEL_OPTIONS[llm_choice]
@@ -107,7 +107,7 @@ SERP_PROVIDER_OPTIONS = {
     "Brave Search API": "brave",
 }
 
-def _extract_page_details(rank: int, item: Dict[str, Any], timeout: float = 15.0) -> Dict[str, Any]:
+def _extract_page_details(rank: int, item: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     """SERP APIの結果URLからtitle/H2/H3を取得し、既存の安全検査を適用する。"""
     url = item.get("url", "")
     result = {
@@ -153,7 +153,7 @@ def _search_brave(
     country: str,
     search_lang: str,
     ui_lang: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Brave Web Search APIから通常のWeb検索結果を取得する。"""
     if not api_key:
         raise ValueError("Brave Search API Keyを入力してください。")
@@ -240,7 +240,7 @@ def step2_fetch_serp_and_filter(
     run_dir: Path,
     *,
     provider: str,
-    credentials: Dict[str, str],
+    credentials: dict[str, str],
     top_n: int = 8,
 ) -> dict:
     """外部SERP APIで順位URLを取得し、各URLの見出しを安全に抽出する。"""
@@ -387,7 +387,7 @@ def step4_propose_originality(
     outline: str,
     run_dir: Path,
     serp_analysis: str = "",
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     system_prompt = load_prompt_file("originality-prompt.md")
     if not system_prompt.strip():
         raise FileNotFoundError(
@@ -423,7 +423,7 @@ def step5_generate_sections_and_assemble(
     llm: LLMService,
     keyword: str,
     outline: str,
-    originality: Dict[str, str],
+    originality: dict[str, str],
     run_dir: Path,
     serp_analysis: str = "",
 ) -> str:
