@@ -28,7 +28,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional, List, Tuple, Dict, Set, Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -37,7 +37,7 @@ from selectolax.parser import HTMLParser
 
 # --- 既知ペイロード(security-model.md レイヤー2 と同期させること) -------------
 
-_PAYLOAD_SUBSTRINGS: tuple[str, ...] = (
+_PAYLOAD_SUBSTRINGS: Tuple[str, ...] = (
     "ignore previous",
     "ignore above",
     "system:",
@@ -54,7 +54,7 @@ _PAYLOAD_SUBSTRINGS: tuple[str, ...] = (
     "wget ",
 )
 
-_PAYLOAD_REGEXES: tuple[re.Pattern[str], ...] = (
+_PAYLOAD_REGEXES: Tuple[re.Pattern, ...] = (
     re.compile(r"send\s+to[^a-z]{0,20}https?://", re.IGNORECASE),
 )
 
@@ -80,14 +80,14 @@ _HEADING_MAX_LEN = 200
 class FetchResult:
     rank: int
     url: str
-    title: str | None = None
-    h2: list[str] = field(default_factory=list)
-    h3: list[str] = field(default_factory=list)
+    title: Optional[str] = None
+    h2: List[str] = field(default_factory=list)
+    h3: List[str] = field(default_factory=list)
     fetch_error: bool = False
     blocked_count: int = 0
-    notes: list[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "rank": self.rank,
             "url": self.url,
@@ -144,18 +144,18 @@ _GOOGLE_INTERNAL_HOSTS = (
 )
 
 
-def _extract_serp_urls_from_google_html(html: str, top_n: int) -> list[str]:
+def _extract_serp_urls_from_google_html(html: str, top_n: int) -> List[str]:
     """Google 検索結果ページ HTML から上位 N 件の URL を抽出"""
     tree = HTMLParser(html)
-    urls: list[str] = []
-    seen: set[str] = set()
+    urls: List[str] = []
+    seen: Set[str] = set()
 
     for a in tree.css("a"):
         href = a.attributes.get("href")
         if not href:
             continue
 
-        candidate: str | None = None
+        candidate: Optional[str] = None
         if href.startswith("/url?"):
             qs = parse_qs(urlparse(href).query)
             q = qs.get("q", [None])[0]
@@ -188,7 +188,7 @@ def fetch_google_serp(
     top_n: int,
     user_agent: str,
     timeout: float,
-) -> list[str]:
+) -> List[str]:
     """Google 検索結果ページを httpx で取得して上位 URL を返す(--engine http)"""
     params = {
         "q": keyword,
@@ -216,7 +216,7 @@ def fetch_google_serp_playwright(
     user_agent: str,
     timeout: float,
     headed: bool = False,
-) -> list[str]:
+) -> List[str]:
     """Playwright で Google SERP HTML を取得し上位 URL を返す。
 
     URL 抽出は _extract_serp_urls_from_google_html() を共用するため、その後段で
@@ -389,7 +389,7 @@ def fetch_page_headings(
     url: str,
     user_agent: str,
     timeout: float,
-) -> tuple[str | None, list[str], list[str], list[str]]:
+) -> Tuple[Optional[str], List[str], List[str], List[str]]:
     """1 ページを取得し (title, h2[], h3[], notes[]) を返す。
     通信/パース失敗時は例外を投げる(呼び出し側で notes に詰める)。
     """
@@ -430,7 +430,7 @@ _DEFAULT_HTTP_UA = "ictGrowthHacker-SerpFetcher/1.0 (+seo-growth-navigator Skill
 # Playwright 経路で Bot UA を使うと Google にブロックされるため、実 Chrome を偽装する。
 # 用途は Google SERP の bot 検知回避に限定(本文ページ取得には使わない)。
 # 複数 UA をローテーションして単一指紋検知を避ける(searchRankRecorder の手法を踏襲)。
-_PLAYWRIGHT_UA_POOL: tuple[str, ...] = (
+_PLAYWRIGHT_UA_POOL: Tuple[str, ...] = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -440,7 +440,7 @@ _DEFAULT_PLAYWRIGHT_UA = _PLAYWRIGHT_UA_POOL[0]
 _DEFAULT_UA = _DEFAULT_HTTP_UA
 
 
-def _should_exclude(url: str, exclude_hosts: list[str]) -> bool:
+def _should_exclude(url: str, exclude_hosts: List[str]) -> bool:
     host = urlparse(url).netloc.lower()
     return any(h.lower() in host for h in exclude_hosts)
 
@@ -451,10 +451,10 @@ def run(
     out_path: Path,
     user_agent: str,
     timeout: float,
-    exclude_hosts: list[str],
-    run_id: str | None,
+    exclude_hosts: List[str],
+    run_id: Optional[str],
     engine: str = "http",
-    serp_user_agent: str | None = None,
+    serp_user_agent: Optional[str] = None,
     headed: bool = False,
 ) -> int:
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -507,7 +507,7 @@ def run(
         return 0
 
     # 3. 各 URL を順次取得
-    results: list[FetchResult] = []
+    results: List[FetchResult] = []
     for rank, url in enumerate(target_urls, start=1):
         fr = FetchResult(rank=rank, url=url)
         try:
@@ -553,11 +553,11 @@ def run(
 
 def _write_output(
     out_path: Path,
-    run_id: str | None,
+    run_id: Optional[str],
     keyword: str,
     fetched_at: str,
     top_n: int,
-    results: list[FetchResult],
+    results: List[FetchResult],
 ) -> None:
     payload = {
         "run_id": run_id,
@@ -573,7 +573,7 @@ def _write_output(
     )
 
 
-def _infer_run_id(out_path: Path) -> str | None:
+def _infer_run_id(out_path: Path) -> Optional[str]:
     # `.seo/runs/{run_id}/03-serp.json` 形式なら親ディレクトリ名を run_id とする
     parent = out_path.parent
     if parent.parent.name == "runs":
@@ -581,7 +581,7 @@ def _infer_run_id(out_path: Path) -> str | None:
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="SERP 取得 + サニタイズ済み H2/H3 抽出 (seo-growth-navigator Skill 用)"
     )
