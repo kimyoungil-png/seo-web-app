@@ -385,6 +385,62 @@ def _normalize_suggestions(section: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _suggestions_from_serp_fallback(
+    keyword: str,
+    top_n: int,
+    *,
+    discussions: Sequence[Dict[str, Any]],
+    web_items: Sequence[Dict[str, Any]],
+    video_items: Sequence[Dict[str, Any]],
+    news_items: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build related-query candidates from already retrieved Brave SERP data.
+
+    Brave Autosuggest is a separately subscribed option. When the active plan does
+    not include it, the workflow must continue without inventing search-volume data.
+    Titles from discussions are prioritized because they are often phrased as real
+    user questions, followed by Web, Video and News titles.
+    """
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
+    for source_label, items in (
+        ("Discussions", discussions),
+        ("Web", web_items),
+        ("Videos", video_items),
+        ("News", news_items),
+    ):
+        for item in items:
+            title = _clean_text(item.get("title"))
+            if not title:
+                continue
+            candidates.append((source_label, item))
+
+    normalized_keyword = re.sub(r"\s+", " ", keyword).strip().casefold()
+    seen: set = set()
+    output: List[Dict[str, Any]] = []
+    for source_label, item in candidates:
+        title = _clean_text(item.get("title"))
+        key = re.sub(r"\s+", " ", title).strip().casefold()
+        if not key or key == normalized_keyword or key in seen:
+            continue
+        seen.add(key)
+        output.append(
+            {
+                "rank": len(output) + 1,
+                "query": title,
+                "title": title,
+                "description": "Related-query candidate derived from Brave {0} results".format(
+                    source_label
+                ),
+                "image": _clean_text(item.get("thumbnail")),
+                "source": source_label,
+                "fallback": True,
+            }
+        )
+        if len(output) >= min(max(top_n, 1), 20):
+            break
+    return output
+
+
 def _brave_get(
     endpoint: str,
     api_key: str,
@@ -591,20 +647,22 @@ def _search_brave(
     except Exception as exc:
         errors["videos"] = str(exc)
 
-    # Autosuggest is a separate Brave endpoint. Use only the parameters documented
-    # for this endpoint: q, country and count. In particular, do not pass the Web
-    # Search `search_lang` value as `lang`, and do not require rich suggestions.
+    # Autosuggest is a separately subscribed Brave option. Try it first, but
+    # fall back to related-query candidates from the already collected SERP
+    # sources when the plan does not include Autosuggest or the endpoint fails.
     suggestion_items: List[Dict[str, Any]] = []
     suggestion_meta: Dict[str, Any] = {
         "requested_query": keyword.strip(),
         "requested_country": country,
         "attempts": [],
+        "source_mode": "autosuggest",
     }
     base_suggest_params: Dict[str, Any] = {
         "q": keyword.strip(),
         "country": country,
         "count": min(max(top_n, 1), 20),
     }
+    autosuggest_error = ""
     try:
         suggest_raw = _brave_get(
             "/res/v1/suggest/search",
@@ -622,8 +680,6 @@ def _search_brave(
             }
         )
 
-        # Some country-localized queries may legitimately return no suggestions.
-        # Retry once without country rather than silently showing a permanent zero.
         if not suggestion_items:
             global_params = {
                 "q": keyword.strip(),
@@ -646,19 +702,53 @@ def _search_brave(
             )
             if suggestion_items:
                 warnings["suggestion"] = (
-                    "Country-specific Autosuggest returned 0 results, so a global "
-                    "Autosuggest request was used."
+                    "Country-specific Autosuggest returned 0 results, so the global "
+                    "Autosuggest response is shown."
+                )
+    except Exception as exc:
+        autosuggest_error = str(exc)
+        suggestion_meta["attempts"].append(
+            {"mode": "autosuggest_error", "result_count": 0, "error": autosuggest_error}
+        )
+
+    if not suggestion_items:
+        suggestion_items = _suggestions_from_serp_fallback(
+            keyword,
+            top_n,
+            discussions=discussions,
+            web_items=web_items,
+            video_items=video_items,
+            news_items=news_items,
+        )
+        suggestion_meta["source_mode"] = "serp_fallback"
+        suggestion_meta["attempts"].append(
+            {
+                "mode": "serp_fallback",
+                "result_count": len(suggestion_items),
+                "sources": ["Discussions", "Web", "Videos", "News"],
+            }
+        )
+        if suggestion_items:
+            if "OPTION_NOT_IN_PLAN" in autosuggest_error:
+                warnings["suggestion"] = (
+                    "Brave Autosuggest is not included in the active plan. "
+                    "Related-query candidates were created from the existing Brave SERP results instead."
+                )
+            elif autosuggest_error:
+                warnings["suggestion"] = (
+                    "Autosuggest could not be retrieved. Related-query candidates were created "
+                    "from the existing Brave SERP results instead."
                 )
             else:
                 warnings["suggestion"] = (
-                    "Brave Autosuggest returned 0 results for both country-specific "
-                    "and global requests."
+                    "Autosuggest returned 0 results. Related-query candidates were created "
+                    "from the existing Brave SERP results instead."
                 )
-    except Exception as exc:
-        errors["suggestion"] = str(exc)
-        suggestion_meta["attempts"].append(
-            {"mode": "error", "result_count": 0, "error": str(exc)}
-        )
+        else:
+            warnings["suggestion"] = (
+                "No Autosuggest or SERP-derived related-query candidates were available for this query."
+            )
+
 
     return {
         "web": web_items,

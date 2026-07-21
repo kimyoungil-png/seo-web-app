@@ -54,9 +54,10 @@
 
 各H2について、次を必ず指定する。
 
-- `Evidence Required`: 統計、法律、料金、仕様、調査、事例など、出典が必要な情報。不要なら「なし」。
-- `Freshness Check`: 最新確認が必要な情報と確認すべき時点。不要なら「なし」。
-- `Preferred Source Type`: 公的機関、公式情報、一次情報、業界団体など。不要なら「なし」。
+- `Evidence Required`: 統計、法律、料金、仕様、調査、事例など、出典が必要な場合だけ出力する。
+- `Freshness Check`: 最新確認が必要な場合だけ、確認対象と基準時点を出力する。
+- `Preferred Source Type`: 出典が必要な場合だけ、公的機関、公式情報、一次情報、業界団体などの優先情報源を出力する。
+- 該当しない項目は「なし」「不要」「N/A」と書かず、項目の行自体を省略する。
 
 時点依存の情報を、根拠なしで断定する構成にしない。
 
@@ -66,7 +67,7 @@
 - 見出しは「自社サイト紹介」のような宣伝見出しではなく、読者の課題解決や次の行動につながる表現にする。
 - URL文字列だけから、サービス内容、価格、機能、実績、専門性、対応範囲を推測しない。
 - Owned Site URLの役割は、読者が追加情報を確認する案内先として設計する。
-- 各H2の`Owned Site Role`に、案内の必要性と自然なアンカーテキスト案を記載する。関係しないH2は「なし」。
+- 各H2の`Owned Site Role`は、案内が必要なH2だけに、役割と自然なアンカーテキスト案を記載する。関係しないH2では項目自体を省略する。
 - Owned Site URLへの案内は記事全体で過剰に繰り返さない。
 
 ### 8. FAQ
@@ -79,7 +80,7 @@
 ### 9. CTA URL
 
 - CTA URLが入力されている場合のみ、記事文脈に最も合う1つのH2へCTAを配置する。
-- CTA URLが未入力の場合、リンク、仮URL、CTAプレースホルダーを構成へ入れない。
+- CTA URLが未入力の場合、リンク、仮URL、CTAプレースホルダー、`CTA Placement`の行を構成へ入れない。
 - CTAは過度な煽りや成果保証を避け、読者の次の行動を具体的に示す。
 - CTA URLとOwned Site URLが同じ場合は、1つの自然な導線として設計し、重複リンクを前提にしない。
 
@@ -97,7 +98,7 @@ Markdownだけを出力してください。
 - Target Audience: <想定読者>
 - Reader Goal: <読了後に理解・判断・実行できること>
 - Owned Site URL: <入力されたURL>
-- CTA URL: <入力されたURL。未入力なら「なし」>
+- CTA URL: <入力されている場合だけこの行を出力>
 
 > **Key Takeaways**
 > - <記事全体の具体的な結論>
@@ -109,15 +110,15 @@ Markdownだけを出力してください。
 - Direct Answer: <冒頭で示す結論>
 - 要点:
   - <このセクションで説明する内容>
-- H3候補:
+- H3候補: <H3が必要な場合だけこの項目と候補を出力>
   - ### <H3見出し>
   - ### <H3見出し>
 - Recommended Format: <本文 / 比較表 / 番号付き手順 / 箇条書き / チェックリスト / FAQ>
-- Evidence Required: <必要な出典。不要なら「なし」>
-- Freshness Check: <最新確認が必要な内容。不要なら「なし」>
-- Preferred Source Type: <優先する情報源。不要なら「なし」>
-- Owned Site Role: <案内の役割とアンカーテキスト案。不要なら「なし」>
-- CTA Placement: <CTAを置く場合の文脈。不要またはURL未入力なら「なし」>
+- Evidence Required: <必要な場合だけ出力>
+- Freshness Check: <必要な場合だけ出力>
+- Preferred Source Type: <必要な場合だけ出力>
+- Owned Site Role: <必要な場合だけ出力>
+- CTA Placement: <CTA URLがあり、このH2に配置する場合だけ出力>
 
 ## FAQ [id: h2-XX]
 - Reader Question: <追加検索意図への回答>
@@ -127,11 +128,10 @@ Markdownだけを出力してください。
   - ### Q. <質問2>
   - ### Q. <質問3>
 - Recommended Format: FAQ
-- Evidence Required: <必要な出典。不要なら「なし」>
-- Freshness Check: <最新確認が必要な内容。不要なら「なし」>
-- Preferred Source Type: <優先する情報源。不要なら「なし」>
-- Owned Site Role: <必要な場合だけ記載。不要なら「なし」>
-- CTA Placement: なし
+- Evidence Required: <必要な場合だけ出力>
+- Freshness Check: <必要な場合だけ出力>
+- Preferred Source Type: <必要な場合だけ出力>
+- Owned Site Role: <必要な場合だけ出力>
 ```
 
 各H2には必ず連番の安定ID `[id: h2-01]`、`[id: h2-02]` の形式を付けてください。FAQも1つのH2として連番に含めてください。

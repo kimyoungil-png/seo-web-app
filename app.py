@@ -141,30 +141,69 @@ section[data-testid="stSidebar"] { display:none !important; }
   line-height:1.7;
 }
 
-/* Flat editorial accordions, inspired by the supplied Ascent GEO page. */
-[data-testid="stExpander"] {
-  border:0;
+/* Permanently open stage layout. There are no accordion controls. */
+.stage-heading {
+  display:grid;
+  grid-template-columns:72px minmax(0, 1fr) auto;
+  gap:18px;
+  align-items:center;
+  padding:32px 4px 16px;
   border-top:1px solid var(--line);
-  border-bottom:1px solid var(--line);
-  border-radius:0;
-  background:transparent;
-  margin:0;
-  overflow:visible;
+  margin-top:26px;
 }
-[data-testid="stExpander"] + [data-testid="stExpander"] {
-  border-top:0;
+.stage-heading-number {
+  color:var(--blue);
+  font-size:11px;
+  font-weight:900;
+  letter-spacing:.18em;
 }
-[data-testid="stExpander"] summary {
-  min-height:66px;
-  background:transparent;
-  color:var(--ink);
-  font-weight:800;
-  letter-spacing:-.01em;
-  padding:18px 4px;
+.stage-heading-title {
+  font-size:23px;
+  line-height:1.25;
+  font-weight:850;
+  letter-spacing:-.035em;
+  overflow-wrap:anywhere;
 }
-[data-testid="stExpander"] summary:hover { color:var(--blue); }
-[data-testid="stExpander"] details > div {
-  padding:6px 4px 28px;
+.stage-heading-copy {
+  color:var(--muted);
+  line-height:1.55;
+  margin-top:5px;
+}
+.stage-status {
+  border:1px solid var(--line);
+  padding:7px 11px;
+  color:var(--muted);
+  font-size:9px;
+  font-weight:850;
+  letter-spacing:.15em;
+  text-transform:uppercase;
+  white-space:nowrap;
+}
+.stage-heading.active .stage-status {
+  color:var(--blue);
+  border-color:rgba(36,88,255,.36);
+  background:var(--blue-pale);
+}
+.stage-heading.complete .stage-status {
+  color:#087547;
+  border-color:rgba(15,191,116,.42);
+  background:#eafaf2;
+}
+[data-testid="stVerticalBlockBorderWrapper"] {
+  border-radius:0 !important;
+  border-color:var(--line) !important;
+  background:rgba(255,255,255,.72);
+}
+.detail-heading {
+  font-size:14px;
+  font-weight:820;
+  margin:20px 0 9px;
+}
+/* Preserve Streamlit icon fonts even though the app uses a global text font. */
+.material-symbols-rounded,
+.material-symbols-outlined,
+span[data-testid="stIconMaterial"] {
+  font-family:"Material Symbols Rounded","Material Symbols Outlined" !important;
 }
 
 .section-intro {
@@ -254,16 +293,30 @@ label[data-testid="stWidgetLabel"] p {
   border-color:var(--blue) !important;
   transform:translateY(-2px);
 }
-.stButton > button[kind="secondary"],
-.stDownloadButton > button {
+.stButton > button[kind="secondary"] {
   background:var(--done) !important;
   border:1px solid #d1d4da !important;
   color:var(--done-text) !important;
 }
-.stButton > button[kind="secondary"]:not(:disabled):hover,
-.stDownloadButton > button:hover {
+.stButton > button[kind="secondary"]:not(:disabled):hover {
   background:#dedfe3 !important;
   color:var(--ink) !important;
+}
+.stDownloadButton > button {
+  background:#0fbf74 !important;
+  border:1px solid #07945a !important;
+  color:#fff !important;
+  box-shadow:0 10px 28px rgba(15,191,116,.24);
+  animation:downloadGlow 2.4s ease-in-out infinite;
+}
+.stDownloadButton > button::after {
+  content:"  ↓";
+  color:#fff;
+}
+.stDownloadButton > button:hover {
+  background:#07945a !important;
+  color:#fff !important;
+  transform:translateY(-2px);
 }
 
 .next-action {
@@ -293,8 +346,17 @@ label[data-testid="stWidgetLabel"] p {
   background:linear-gradient(90deg, transparent, var(--blue), transparent);
   animation:waveLine 2.8s linear infinite;
 }
-.next-action.done::before { background:#a7abb3; }
-.next-action.done::after { display:none; }
+.next-action.done {
+  border-color:rgba(15,191,116,.55);
+  background:linear-gradient(135deg,#f0fff7,#ffffff);
+  box-shadow:0 12px 32px rgba(15,191,116,.11);
+}
+.next-action.done::before { background:#0fbf74; }
+.next-action.done::after {
+  display:block;
+  background:linear-gradient(90deg, transparent, #0fbf74, transparent);
+  animation:completeLine 3.2s linear infinite;
+}
 .next-action-kicker {
   color:var(--blue);
   font-size:9px;
@@ -302,7 +364,7 @@ label[data-testid="stWidgetLabel"] p {
   letter-spacing:.2em;
   text-transform:uppercase;
 }
-.next-action.done .next-action-kicker { color:#787d86; }
+.next-action.done .next-action-kicker { color:#087547; }
 .next-action-title {
   color:var(--ink);
   font-weight:800;
@@ -365,6 +427,14 @@ div[data-testid="stDataFrame"] {
   0% { transform:translateX(-35%); }
   100% { transform:translateX(35%); }
 }
+@keyframes completeLine {
+  0% { transform:translateX(-35%); }
+  100% { transform:translateX(35%); }
+}
+@keyframes downloadGlow {
+  0%,100% { box-shadow:0 10px 28px rgba(15,191,116,.22), 0 0 0 0 rgba(15,191,116,.12); }
+  50% { box-shadow:0 14px 36px rgba(15,191,116,.34), 0 0 0 8px rgba(15,191,116,.08); }
+}
 @keyframes fieldWave {
   0%,100% { border-color:#cfd3dc; box-shadow:0 0 0 0 rgba(36,88,255,0); }
   50% { border-color:var(--blue); box-shadow:0 0 0 5px rgba(36,88,255,.08); }
@@ -377,6 +447,8 @@ div[data-testid="stDataFrame"] {
   .block-container { padding-left:1rem; padding-right:1rem; }
   .hero-title { font-size:28px; }
   .current-stage { grid-template-columns:1fr; gap:5px; }
+  .stage-heading { grid-template-columns:1fr; gap:6px; }
+  .stage-status { justify-self:start; }
   .research-counts { display:block; }
   .research-count { margin-bottom:6px; }
 }
@@ -398,6 +470,8 @@ DEFAULTS: Dict[str, Any] = {
     "article": "",
     "article_confirmed": "",
     "fact_check": "",
+    "factcheck_error": "",
+    "factcheck_error_raw": "",
     "run_dir": None,
     "active_keyword": "",
     "active_llm_choice": "",
@@ -419,7 +493,7 @@ RESET_FIELDS: Dict[str, List[str]] = {
     "outline": ["outline", "outline_confirmed"],
     "originality": ["originality_proposals", "selected_originality", "originality_choice"],
     "article": ["article", "article_confirmed"],
-    "fact": ["fact_check"],
+    "fact": ["fact_check", "factcheck_error", "factcheck_error_raw"],
 }
 RESET_WIDGETS: Dict[str, List[str]] = {
     "serp": [
@@ -529,15 +603,52 @@ def normalize_http_url(value: str) -> str:
     return candidate
 
 
+def clean_outline_optional_lines(value: str) -> str:
+    """Remove optional outline fields whose value explicitly means not applicable."""
+    optional_fields = (
+        "H3候補",
+        "H3 Candidates",
+        "Recommended Format",
+        "Evidence Required",
+        "Freshness Check",
+        "Preferred Source Type",
+        "Owned Site Role",
+        "CTA Placement",
+    )
+    field_pattern = "|".join(re.escape(field) for field in optional_fields)
+    empty_pattern = re.compile(
+        r"^\s*-?\s*(?:{0})\s*:\s*(?:なし|無し|不要|該当なし|なし。|none|n/a|null|-)?\s*$".format(
+            field_pattern
+        ),
+        flags=re.IGNORECASE,
+    )
+    cleaned = [line for line in value.splitlines() if not empty_pattern.match(line)]
+    # Avoid large blank gaps after removing optional lines.
+    output: List[str] = []
+    blank = False
+    for line in cleaned:
+        is_blank = not line.strip()
+        if is_blank and blank:
+            continue
+        output.append(line.rstrip())
+        blank = is_blank
+    return "\n".join(output).strip()
+
+
 def digest_secret(value: str) -> str:
     if not value:
         return ""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def next_button(key: str, completed: bool = False, disabled: bool = False) -> bool:
+def next_button(
+    key: str,
+    completed: bool = False,
+    disabled: bool = False,
+    label: str = "Next",
+) -> bool:
     return st.button(
-        "Next",
+        label,
         type="secondary" if completed else "primary",
         key=key,
         disabled=disabled or completed,
@@ -558,6 +669,47 @@ def render_next_action(title: str, detail: str = "", completed: bool = False) ->
     )
 
 
+def render_stage_heading(
+    number: int,
+    title: str,
+    copy: str,
+    *,
+    complete: bool = False,
+    active: bool = False,
+) -> None:
+    state_class = " complete" if complete else (" active" if active else "")
+    status = "Complete" if complete else ("Current" if active else "Waiting")
+    st.markdown(
+        "<div class='stage-heading{0}'>"
+        "<div class='stage-heading-number'>{1:02d}</div>"
+        "<div><div class='stage-heading-title'>{2}</div>"
+        "<div class='stage-heading-copy'>{3}</div></div>"
+        "<div class='stage-status'>{4}</div>"
+        "</div>".format(state_class, number, html.escape(title), html.escape(copy), status),
+        unsafe_allow_html=True,
+    )
+
+
+def friendly_retry_message(exc: Exception, stage_name: str) -> str:
+    raw = str(exc)
+    upper = raw.upper()
+    if "503" in raw or "UNAVAILABLE" in upper or "HIGH DEMAND" in upper:
+        return (
+            "{0}でAIモデルが一時的に混雑しています。処理済みのデータは保存されています。"
+            "数十秒から数分後に『Retry』を押してください。"
+        ).format(stage_name)
+    if "429" in raw or "RESOURCE_EXHAUSTED" in upper:
+        return (
+            "{0}でAI APIの利用上限に達しました。処理済みのデータは保存されています。"
+            "利用枠の回復後、または別の利用可能なモデルへ切り替えた後に『Retry』を押してください。"
+        ).format(stage_name)
+    if "401" in raw or "UNAUTHENTICATED" in upper or "INVALID API KEY" in upper:
+        return "{0}でAPIキーを認証できませんでした。SetupのAPIキーを確認してください。".format(stage_name)
+    return (
+        "{0}を完了できませんでした。入力内容とAPI設定を確認し、問題が一時的な場合は『Retry』を押してください。"
+    ).format(stage_name)
+
+
 def rows_for(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
@@ -575,15 +727,13 @@ def rows_for(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def outline_confirmation_is_current() -> bool:
     outline = str(st.session_state.get("outline", ""))
     editor = str(st.session_state.get("outline_editor", outline))
-    confirmed = str(st.session_state.get("outline_confirmed", ""))
-    return bool(outline and editor == outline and confirmed == outline)
+    return bool(outline and editor == outline)
 
 
 def article_confirmation_is_current() -> bool:
     article = str(st.session_state.get("article", ""))
     editor = str(st.session_state.get("article_editor", article))
-    confirmed = str(st.session_state.get("article_confirmed", ""))
-    return bool(article and editor == article and confirmed == article)
+    return bool(article and editor == article)
 
 
 def originality_confirmation_is_current() -> bool:
@@ -670,7 +820,8 @@ def render_web_results(data: Dict[str, Any]) -> None:
         )
     )
 
-    with st.expander("View page headings", expanded=False):
+    st.markdown("<div class='detail-heading'>Page headings</div>", unsafe_allow_html=True)
+    with st.container(border=True):
         for result in data.get("web", []):
             st.markdown(
                 "**{0}. {1}**".format(result.get("rank"), result.get("title") or result.get("url"))
@@ -698,7 +849,8 @@ def render_web_results(data: Dict[str, Any]) -> None:
 
     supplemental = data.get("web_analysis_supplement", [])
     if supplemental:
-        with st.expander("Supplemental H2/H3 sources", expanded=False):
+        st.markdown("<div class='detail-heading'>Supplemental H2/H3 sources</div>", unsafe_allow_html=True)
+        with st.container(border=True):
             st.caption(
                 "Lower-ranked editorial pages used to strengthen heading analysis when top results are inaccessible or non-article pages."
             )
@@ -735,34 +887,42 @@ def render_category_results(
 def render_suggestion_results(data: Dict[str, Any]) -> None:
     st.markdown("<div class='subsection-heading'>Suggestion</div>", unsafe_allow_html=True)
     st.markdown(
-        "<div class='subsection-purpose'>検索候補を関連需要とFAQ候補へ変換するために利用します。</div>",
+        "<div class='subsection-purpose'>検索候補またはSERP由来の関連クエリ候補を、関連需要とFAQ候補へ変換します。</div>",
         unsafe_allow_html=True,
     )
     suggestions = data.get("suggestion") or []
+    suggestion_meta = data.get("suggestion_meta") or {}
+    source_mode = suggestion_meta.get("source_mode", "autosuggest")
     if suggestions:
         suggestion_rows = [
             {
                 "Rank": item.get("rank", ""),
                 "Query": item.get("query", ""),
-                "Title": item.get("title", ""),
+                "Source": item.get("source", "Autosuggest" if source_mode == "autosuggest" else "SERP fallback"),
                 "Description": item.get("description", ""),
-                "Image": item.get("image", ""),
             }
             for item in suggestions
         ]
         st.dataframe(suggestion_rows, width="stretch", hide_index=True)
     else:
-        st.info("Suggestion result was not returned for this query.")
+        st.info("この検索語ではSuggestion候補を取得できませんでした。ほかのSERPデータを使ってAnalysisを続行します。")
+
     warnings = data.get("warnings") or {}
     errors = data.get("errors") or {}
     if warnings.get("suggestion"):
         st.warning(warnings["suggestion"])
-    if errors.get("suggestion"):
-        st.error(errors["suggestion"])
-    suggestion_meta = data.get("suggestion_meta") or {}
+    if errors.get("suggestion") and not suggestions:
+        st.warning(
+            "Suggestionの取得に失敗しましたが、Web・Discussions・News・Videos・Analysisは利用できます。"
+        )
+
     attempts = suggestion_meta.get("attempts") or []
-    if attempts:
-        with st.expander("Autosuggest diagnostics", expanded=False):
+    if attempts and st.checkbox(
+        "Show Suggestion technical diagnostics",
+        value=False,
+        key="show_suggestion_diagnostics",
+    ):
+        with st.container(border=True):
             st.json(suggestion_meta)
 
 
@@ -816,10 +976,14 @@ country_options: Dict[str, Dict[str, Any]] = {
 }
 
 # STEP 01 — all settings are intentionally in one vertical flow.
-with st.expander(
-    "01  SETUP — 基本設定",
-    expanded=not bool(st.session_state.setup_confirmed_signature),
-):
+render_stage_heading(
+    1,
+    "SETUP — 基本設定",
+    "検索条件、AI、Owned Site URL、任意のCTA URLを設定します。",
+    complete=bool(st.session_state.setup_confirmed_signature),
+    active=not bool(st.session_state.setup_confirmed_signature),
+)
+with st.container(border=True):
     st.markdown(
         "<div class='section-intro'><strong>検索と生成に必要な条件を、上から順に入力します。</strong>"
         "<span>CTA URLだけは任意です。その他の必須項目を入力し、最下部のNextを押してください。</span></div>",
@@ -971,7 +1135,7 @@ status_placeholder.markdown(
     "<div class='current-stage'>"
     "<div class='current-stage-number'>{0:02d} / 06</div>"
     "<div><div class='current-stage-title'>{1}</div>"
-    "<div class='current-stage-copy'>{2} of 6 stages complete. Open completed sections whenever you need to review or edit them.</div></div>"
+    "<div class='current-stage-copy'>{2} of 6 stages complete. All stages remain open on this page for review and editing.</div></div>"
     "</div>".format(current_idx + 1, STAGES[current_idx], completed_count),
     unsafe_allow_html=True,
 )
@@ -998,10 +1162,14 @@ elif current_idx == 3:
     )
 
 # STEP 02
-with st.expander(
-    "02  SERP RESEARCH — 検索結果の取得・AI Analysis",
-    expanded=states[0] and not states[1],
-):
+render_stage_heading(
+    2,
+    "SERP RESEARCH — 検索結果の取得・AI Analysis",
+    "Web、Discussions、News、Videos、Suggestion、Analysisを順番に確認します。",
+    complete=states[1],
+    active=states[0] and not states[1],
+)
+with st.container(border=True):
     st.markdown(
         "<div class='section-intro'><strong>Brave Searchとページ見出しをまとめ、AI Analysisを作成します。</strong>"
         "<span>Web、Discussions、News、Videos、Suggestionを上から順番に確認できます。タブ切り替えはありません。</span></div>",
@@ -1115,29 +1283,33 @@ with st.expander(
             st.markdown(st.session_state.serp_analysis)
 
             render_next_action(
-                "SERP Research is complete",
+                "SERP Research stage complete",
                 "Continue to Outline. The Outline section opens automatically below.",
                 completed=True,
             )
-            next_button("serp_completed_next", completed=True)
             if st.button("Re-run this step", key="rerun_serp", type="secondary"):
                 reset_search_context()
                 st.rerun()
 
 # STEP 03
-with st.expander(
-    "03  OUTLINE — 構成案の生成・編集",
-    expanded=states[1] and not states[2],
-):
+render_stage_heading(
+    3,
+    "OUTLINE — 構成案の生成・編集",
+    "Analysisをもとに、読者課題ごとの構成、FAQ、出典要件を設計します。",
+    complete=states[2],
+    active=states[1] and not states[2],
+)
+with st.container(border=True):
     st.markdown(
         "<div class='section-intro'><strong>Analysisを根拠に、読者課題ごとの構成を設計します。</strong>"
-        "<span>生成後に内容を確認・編集し、もう一度Nextを押すと構成が確定します。</span></div>",
+        "<span>Nextを1回押すと構成を生成・保存します。生成後の編集は「Apply outline edits」で反映できます。</span></div>",
         unsafe_allow_html=True,
     )
     if not states[1]:
         st.info("Complete SERP Research first.")
     else:
-        with st.expander("Analysis used for this outline", expanded=False):
+        st.markdown("<div class='detail-heading'>Analysis used for this outline</div>", unsafe_allow_html=True)
+        with st.container(border=True):
             st.markdown(st.session_state.serp_analysis or "分析結果がありません。")
 
         if not st.session_state.outline:
@@ -1159,9 +1331,14 @@ with st.expander(
                             owned_site_url=owned_site_url,
                             cta_url=cta_url,
                         )
+                        generated_outline = clean_outline_optional_lines(generated_outline)
                         st.session_state.outline = generated_outline
                         st.session_state.outline_editor = generated_outline
-                        st.session_state.outline_confirmed = ""
+                        st.session_state.outline_confirmed = generated_outline
+                        save_outline(
+                            ensure_run_dir(keyword, llm_choice, current_search_settings, content_settings),
+                            generated_outline,
+                        )
                     st.rerun()
                 except Exception as exc:
                     st.error("Outline generation error: {0}".format(exc))
@@ -1174,8 +1351,13 @@ with st.expander(
                     "Save this outline and continue to Originality",
                     "Review the H2/H3 order, Key Takeaways, FAQ and evidence requirements before continuing.",
                 )
-                if next_button("outline_save_next", disabled=not st.session_state.outline_editor.strip()):
-                    st.session_state.outline = st.session_state.outline_editor
+                if next_button(
+                    "outline_save_next",
+                    disabled=not st.session_state.outline_editor.strip(),
+                    label="Apply outline edits",
+                ):
+                    st.session_state.outline = clean_outline_optional_lines(st.session_state.outline_editor)
+                    st.session_state.outline_editor = st.session_state.outline
                     save_outline(
                         ensure_run_dir(keyword, llm_choice, current_search_settings, content_settings),
                         st.session_state.outline,
@@ -1185,20 +1367,23 @@ with st.expander(
                     st.rerun()
             else:
                 render_next_action(
-                    "Outline is confirmed",
-                    "Continue to Originality. Editing this text reactivates the Next button.",
+                    "Outline stage complete",
+                    "The saved outline is ready for Originality. Editing the text activates the Apply button.",
                     completed=True,
                 )
-                next_button("outline_completed_next", completed=True)
                 if st.button("Regenerate outline", key="regenerate_outline", type="secondary"):
                     reset_from("outline")
                     st.rerun()
 
 # STEP 04
-with st.expander(
-    "04  ORIGINALITY — 独自要素の提案・選択・追加情報",
-    expanded=states[2] and not states[3],
-):
+render_stage_heading(
+    4,
+    "ORIGINALITY — 独自要素の提案・選択・追加情報",
+    "3つの案から1つを選び、参考URLや意見を追加します。",
+    complete=states[3],
+    active=states[2] and not states[3],
+)
+with st.container(border=True):
     st.markdown(
         "<div class='section-intro'><strong>競合ギャップから3案を作り、1案と追加情報を確定します。</strong>"
         "<span>選択肢、参考URL、意見、現場の知見をArticle Generationへ引き継ぎます。</span></div>",
@@ -1213,7 +1398,7 @@ with st.expander(
                 "Generate three originality ideas",
                 "The ideas are based on content gaps, user pain points, trend signals and the Owned Site perspective.",
             )
-            if next_button("originality_generate_next"):
+            if next_button("originality_generate_next", label="Generate 3 ideas"):
                 reset_from("originality")
                 try:
                     llm = create_llm_service(api_key, llm_choice)
@@ -1296,23 +1481,26 @@ with st.expander(
                     st.rerun()
             else:
                 render_next_action(
-                    "Originality is confirmed",
-                    "Continue to Article Generation. Changing the choice or notes reactivates Next.",
+                    "Originality stage complete",
+                    "The selected idea and additional information are ready for Article Generation.",
                     completed=True,
                 )
-                next_button("originality_completed_next", completed=True)
                 if st.button("Regenerate ideas", key="regenerate_originality", type="secondary"):
                     reset_from("originality")
                     st.rerun()
 
 # STEP 05
-with st.expander(
-    "05  ARTICLE GENERATION — 記事生成・編集",
-    expanded=states[3] and not states[4],
-):
+render_stage_heading(
+    5,
+    "ARTICLE GENERATION — 記事生成・編集",
+    "Outline、独自性、追加情報、Owned Site、CTAを反映して記事を生成します。",
+    complete=states[4],
+    active=states[3] and not states[4],
+)
+with st.container(border=True):
     st.markdown(
         "<div class='section-intro'><strong>Outline、Analysis、独自性、追加情報から本文を生成します。</strong>"
-        "<span>生成後に編集し、もう一度Nextを押すと記事が確定してFact Checkへ進みます。</span></div>",
+        "<span>Nextを1回押すと記事を生成・保存します。生成後の編集は「Apply article edits」で反映できます。</span></div>",
         unsafe_allow_html=True,
     )
     if not states[3]:
@@ -1340,7 +1528,11 @@ with st.expander(
                         )
                         st.session_state.article = generated_article
                         st.session_state.article_editor = generated_article
-                        st.session_state.article_confirmed = ""
+                        st.session_state.article_confirmed = generated_article
+                        save_article(
+                            ensure_run_dir(keyword, llm_choice, current_search_settings, content_settings),
+                            generated_article,
+                        )
                     st.rerun()
                 except Exception as exc:
                     st.error("Article generation error: {0}".format(exc))
@@ -1354,7 +1546,11 @@ with st.expander(
                     "Save this article and continue to Fact Check",
                     "Review the title, description, Key Takeaways, Owned Site references and CTA before continuing.",
                 )
-                if next_button("article_save_next", disabled=not st.session_state.article_editor.strip()):
+                if next_button(
+                    "article_save_next",
+                    disabled=not st.session_state.article_editor.strip(),
+                    label="Apply article edits",
+                ):
                     st.session_state.article = st.session_state.article_editor
                     save_article(
                         ensure_run_dir(keyword, llm_choice, current_search_settings, content_settings),
@@ -1365,11 +1561,10 @@ with st.expander(
                     st.rerun()
             else:
                 render_next_action(
-                    "Article is confirmed",
-                    "Continue to Fact Check. Editing the article reactivates Next.",
+                    "Article stage complete",
+                    "The saved article is ready for Fact Check. Editing the text activates the Apply button.",
                     completed=True,
                 )
-                next_button("article_completed_next", completed=True)
                 st.download_button(
                     "Download Markdown",
                     st.session_state.article,
@@ -1381,10 +1576,14 @@ with st.expander(
                     st.rerun()
 
 # STEP 06
-with st.expander(
-    "06  FACT CHECK — ファクトチェック",
-    expanded=states[4] and not states[5],
-):
+render_stage_heading(
+    6,
+    "FACT CHECK — ファクトチェック",
+    "記事の事実を抽出し、Brave Searchの証拠と選択中のAIで検証します。",
+    complete=states[5],
+    active=states[4] and not states[5],
+)
+with st.container(border=True):
     st.markdown(
         "<div class='section-intro'><strong>記事内の事実を抽出し、Brave Searchの証拠で検証します。</strong>"
         "<span>選択中のAIは5件ずつ判定し、途中経過を保存します。AI固有のWeb検索機能は使いません。</span></div>",
@@ -1393,12 +1592,26 @@ with st.expander(
     if not states[4]:
         st.info("Complete Article Generation first.")
     elif not st.session_state.fact_check:
+        retrying = bool(st.session_state.factcheck_error)
+        if retrying:
+            st.warning(st.session_state.factcheck_error)
+            if st.checkbox("Show technical error details", value=False, key="show_factcheck_error"):
+                st.code(st.session_state.factcheck_error_raw or "No technical detail was stored.")
         render_next_action(
-            "Run the fact check",
-            "Facts are extracted, Brave evidence is collected and verdicts are generated in resumable batches.",
+            "Retry the fact check" if retrying else "Run the fact check",
+            (
+                "Completed extraction, evidence and batch results are reused. Press Retry after the temporary issue clears."
+                if retrying
+                else "Facts are extracted, Brave evidence is collected and verdicts are generated in resumable batches."
+            ),
         )
-        if next_button("factcheck_next"):
-            reset_from("fact")
+        if next_button(
+            "factcheck_next",
+            label="Retry Fact Check" if retrying else "Next",
+        ):
+            st.session_state.fact_check = ""
+            st.session_state.factcheck_error = ""
+            st.session_state.factcheck_error_raw = ""
             progress_bar = st.progress(0.0)
             progress_text = st.empty()
 
@@ -1426,7 +1639,9 @@ with st.expander(
                 progress_text.caption("Fact Check complete")
                 st.rerun()
             except Exception as exc:
-                st.error("Fact Check error: {0}".format(exc))
+                st.session_state.factcheck_error = friendly_retry_message(exc, "Fact Check")
+                st.session_state.factcheck_error_raw = str(exc)
+                st.rerun()
     else:
         st.markdown(st.session_state.fact_check)
         st.download_button(
@@ -1436,17 +1651,17 @@ with st.expander(
             mime="text/markdown",
         )
         render_next_action(
-            "All stages are complete",
-            "Download the article and Fact Check report, or reopen any section above to review it.",
+            "ALL STAGES COMPLETE",
+            "The article and Fact Check report are ready. Use the green download buttons to export the files.",
             completed=True,
         )
-        next_button("factcheck_completed_next", completed=True)
         if st.button("Run Fact Check again", key="rerun_factcheck", type="secondary"):
             reset_from("fact")
             st.rerun()
 
 st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-with st.expander("Workflow options", expanded=False):
+st.markdown("<div class='detail-heading'>Workflow options</div>", unsafe_allow_html=True)
+with st.container(border=True):
     st.caption("Reset removes session-state results and starts a new run. API keys are not written to run files.")
     if st.button("Reset workflow", key="reset_workflow", type="secondary", width="stretch"):
         reset_all()
