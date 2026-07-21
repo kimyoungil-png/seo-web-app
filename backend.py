@@ -1,27 +1,29 @@
-import base64
+from __future__ import annotations
+
 import json
 import re
 import time
-from pathlib import Path
-from typing import Any
 from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
-
 from google import genai
 from google.genai import types
 from openai import OpenAI
 
 import fetch_serp
 
-MODEL_OPTIONS = {
-    "Gemini 3.1 Flash-Lite Preview": {
+
+MODEL_OPTIONS: Dict[str, Dict[str, str]] = {
+    "Gemini 3.1 Flash-Lite": {
         "provider": "gemini",
-        "model": "gemini-3.1-flash-lite-preview",
+        "model": "gemini-3.1-flash-lite",
     },
-    "Gemini Flash Latest": {
+    "Gemini 3.5 Flash": {
         "provider": "gemini",
-        "model": "gemini-flash-latest",
+        "model": "gemini-3.5-flash",
     },
     "OpenAI GPT-5 mini": {
         "provider": "openai",
@@ -30,9 +32,9 @@ MODEL_OPTIONS = {
 }
 
 
-def get_model_config(llm_choice: str) -> dict[str, str]:
+def get_model_config(llm_choice: str) -> Dict[str, str]:
     if llm_choice not in MODEL_OPTIONS:
-        raise ValueError(f"未対応のモデルです: {llm_choice}")
+        raise ValueError("未対応のモデルです: {0}".format(llm_choice))
     return MODEL_OPTIONS[llm_choice]
 
 
@@ -48,12 +50,12 @@ class LLMService:
         self.model = self.config["model"]
         self.client = self._create_client(api_key)
 
-    def _create_client(self, api_key: str):
+    def _create_client(self, api_key: str) -> Any:
         if self.provider == "gemini":
             return genai.Client(api_key=api_key)
         if self.provider == "openai":
             return OpenAI(api_key=api_key)
-        raise ValueError(f"未対応のAIプロバイダーです: {self.provider}")
+        raise ValueError("未対応のAIプロバイダーです: {0}".format(self.provider))
 
     def generate(
         self,
@@ -61,34 +63,44 @@ class LLMService:
         user_prompt: str = "",
         *,
         use_web_search: bool = False,
+        temperature: float = 0.7,
     ) -> str:
-        """Outline / Originality / Article / Fact Checkの全処理が必ずこの入口を通る。"""
+        """Analysis / Outline / Originality / Article / Fact Checkの共通入口。"""
+        if not system_prompt.strip():
+            raise ValueError("System promptが空です。")
+
+        input_text = user_prompt.strip() or "上記の指示に従って結果を出力してください。"
+
         if self.provider == "gemini":
-            gemini_config = types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.7,
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-                if use_web_search
-                else None,
-            )
+            config_kwargs: Dict[str, Any] = {
+                "system_instruction": system_prompt,
+                "temperature": temperature,
+            }
+            if use_web_search:
+                config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+            config = types.GenerateContentConfig(**config_kwargs)
             response = self.client.models.generate_content(
                 model=self.model,
-                contents=user_prompt or system_prompt,
-                config=gemini_config,
+                contents=input_text,
+                config=config,
             )
-            if not response.text:
+            text = getattr(response, "text", None)
+            if not text:
                 raise RuntimeError("Geminiからテキスト応答を取得できませんでした。")
-            return response.text
+            return str(text)
 
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=system_prompt,
-            input=user_prompt or system_prompt,
-            tools=[{"type": "web_search"}] if use_web_search else [],
-        )
-        if not response.output_text:
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "instructions": system_prompt,
+            "input": input_text,
+        }
+        if use_web_search:
+            request["tools"] = [{"type": "web_search"}]
+        response = self.client.responses.create(**request)
+        text = getattr(response, "output_text", None)
+        if not text:
             raise RuntimeError("OpenAIからテキスト応答を取得できませんでした。")
-        return response.output_text
+        return str(text)
 
 
 def create_llm_service(api_key: str, llm_choice: str) -> LLMService:
@@ -103,22 +115,486 @@ def load_prompt_file(filename: str) -> str:
     return ""
 
 
-SERP_PROVIDER_OPTIONS = {
-    "Brave Search API": "brave",
-}
+def load_sop_step(step_prefix: str) -> str:
+    """Return only one current Step section so unrelated stage instructions do not conflict."""
+    sop = load_prompt_file("sop.md")
+    if not sop:
+        return ""
+    lines = sop.splitlines()
+    start: Optional[int] = None
+    for index, line in enumerate(lines):
+        if line.startswith("## {0}".format(step_prefix)):
+            start = index
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("## Step "):
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()
 
-def _extract_page_details(rank: int, item: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
-    """SERP APIの結果URLからtitle/H2/H3を取得し、既存の安全検査を適用する。"""
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_manifest(run_dir: Path) -> Dict[str, Any]:
+    path = run_dir / "run.json"
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def update_run_manifest(run_dir: Path, phase: str, **updates: Any) -> Dict[str, Any]:
+    """現在の実装で実際に生成する成果物だけをrun.jsonに記録する。"""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _read_manifest(run_dir)
+    manifest.setdefault("run_id", run_dir.name)
+    manifest.setdefault("started_at", _utc_now())
+    manifest["phase"] = phase
+    manifest["updated_at"] = _utc_now()
+    manifest.update(updates)
+    (run_dir / "run.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
+
+
+def initialize_run(
+    run_dir: Path,
+    *,
+    keyword: str,
+    llm_choice: str,
+    search_settings: Dict[str, Any],
+    content_settings: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Create or refresh run context without discarding the current phase or artifacts."""
+    existing = _read_manifest(run_dir)
+    update_run_manifest(
+        run_dir,
+        str(existing.get("phase") or "setup-ready"),
+        keyword=keyword,
+        ai={
+            "choice": llm_choice,
+            "provider": get_model_config(llm_choice)["provider"],
+            "model": get_model_config(llm_choice)["model"],
+        },
+        search_settings=search_settings,
+        content_settings=content_settings or {},
+        artifacts=existing.get("artifacts", {}),
+    )
+
+
+def save_outline(run_dir: Path, outline: str) -> None:
+    path = run_dir / "05-outline.md"
+    path.write_text(outline, encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "outline-ready",
+        artifacts={**_read_manifest(run_dir).get("artifacts", {}), "outline": str(path)},
+    )
+
+
+def save_selected_originality(run_dir: Path, originality: Dict[str, str]) -> None:
+    path = run_dir / "07-selected-originality.json"
+    path.write_text(json.dumps(originality, ensure_ascii=False, indent=2), encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "originality-selected",
+        selected_originality=originality,
+        artifacts={
+            **_read_manifest(run_dir).get("artifacts", {}),
+            "selected_originality": str(path),
+        },
+    )
+
+
+def save_article(run_dir: Path, article: str) -> None:
+    path = run_dir / "09-article.md"
+    path.write_text(article, encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "article-ready",
+        artifacts={**_read_manifest(run_dir).get("artifacts", {}), "article": str(path)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Brave Search API
+# ---------------------------------------------------------------------------
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return re.sub(r"<[^>]+>", "", str(value)).strip()
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("results", "items", "data"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return nested
+        return [value]
+    return []
+
+
+def _first_value(item: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return ""
+
+
+def _source_name(raw: Dict[str, Any]) -> str:
+    direct = _first_value(raw, "source", "forum_name", "publisher", "site_name")
+    if direct:
+        return _clean_text(direct)
+    profile = raw.get("profile")
+    if isinstance(profile, dict):
+        return _clean_text(_first_value(profile, "long_name", "name", "url"))
+    meta_url = raw.get("meta_url")
+    if isinstance(meta_url, dict):
+        return _clean_text(_first_value(meta_url, "hostname", "netloc", "path"))
+    return ""
+
+
+def _normalize_result_items(section: Any, category: str) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, raw_value in enumerate(_as_list(section), 1):
+        raw: Dict[str, Any]
+        if isinstance(raw_value, dict):
+            raw = raw_value
+        else:
+            raw = {"text": raw_value}
+
+        title = _clean_text(_first_value(raw, "title", "question", "name", "query"))
+        description = _clean_text(
+            _first_value(raw, "description", "answer", "snippet", "text", "long_desc")
+        )
+        url = _clean_text(_first_value(raw, "url", "link", "source_url"))
+        age = _clean_text(
+            _first_value(raw, "age", "page_age", "published", "date", "published_time")
+        )
+        thumbnail = _first_value(raw, "thumbnail", "image")
+        if isinstance(thumbnail, dict):
+            thumbnail = _first_value(thumbnail, "src", "url", "original")
+
+        normalized.append(
+            {
+                "rank": index,
+                "category": category,
+                "title": title,
+                "url": url,
+                "snippet": description,
+                "source": _source_name(raw),
+                "age": age,
+                "thumbnail": _clean_text(thumbnail),
+            }
+        )
+    return normalized
+
+
+def _normalize_suggestions(section: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, raw_value in enumerate(_as_list(section), 1):
+        raw = raw_value if isinstance(raw_value, dict) else {"query": raw_value}
+        image = _first_value(raw, "img", "image", "thumbnail")
+        if isinstance(image, dict):
+            image = _first_value(image, "src", "url", "original")
+        normalized.append(
+            {
+                "rank": index,
+                "query": _clean_text(_first_value(raw, "query", "title", "name")),
+                "title": _clean_text(_first_value(raw, "title", "query", "name")),
+                "description": _clean_text(
+                    _first_value(raw, "description", "subtitle", "summary")
+                ),
+                "image": _clean_text(image),
+            }
+        )
+    return normalized
+
+
+def _brave_get(
+    endpoint: str,
+    api_key: str,
+    params: Dict[str, Any],
+    *,
+    label: str,
+    location_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    if not api_key:
+        raise ValueError("Brave Search API Keyを入力してください。")
+
+    headers: Dict[str, str] = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": api_key,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/134.0.0.0 Safari/537.36"
+        ),
+    }
+    if location_headers:
+        headers.update(location_headers)
+
+    url = "https://api.search.brave.com{0}".format(endpoint)
+    response = httpx.get(url, headers=headers, params=params, timeout=30.0)
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Brave {0} API error {1}: {2}".format(label, response.status_code, response.text)
+        )
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Brave {0} API returned a non-object response.".format(label))
+    return data
+
+
+def _web_search_params(
+    keyword: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> Dict[str, Any]:
+    return {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 20),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": True,
+        "text_decorations": False,
+        "extra_snippets": True,
+        "operators": True,
+    }
+
+
+def _news_search_params(
+    keyword: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> Dict[str, Any]:
+    return {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 50),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": True,
+        "extra_snippets": True,
+        "operators": True,
+    }
+
+
+def _video_search_params(
+    keyword: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> Dict[str, Any]:
+    return {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 50),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": True,
+        "operators": True,
+    }
+
+
+def _search_brave(
+    keyword: str,
+    api_key: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+    location_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """用途別エンドポイントを実行し、失敗した任意カテゴリだけエラーとして保持する。"""
+    errors: Dict[str, str] = {}
+    warnings: Dict[str, str] = {}
+
+    web_raw = _brave_get(
+        "/res/v1/web/search",
+        api_key,
+        _web_search_params(
+            keyword,
+            top_n,
+            country=country,
+            search_lang=search_lang,
+            ui_lang=ui_lang,
+        ),
+        label="Web Search",
+        location_headers=location_headers,
+    )
+    web_items = _normalize_result_items(web_raw.get("web"), "web")[:top_n]
+
+    discussion_sites: Sequence[Tuple[str, str]] = (
+        ("Reddit", "reddit.com"),
+        ("Yahoo!知恵袋", "chiebukuro.yahoo.co.jp"),
+        ("価格.com掲示板", "bbs.kakaku.com"),
+    )
+    discussions: List[Dict[str, Any]] = []
+    per_site_count = min(max(top_n, 1), 10)
+    for source_label, site in discussion_sites:
+        try:
+            query = "{0} site:{1}".format(keyword, site)
+            data = _brave_get(
+                "/res/v1/web/search",
+                api_key,
+                _web_search_params(
+                    query,
+                    per_site_count,
+                    country=country,
+                    search_lang=search_lang,
+                    ui_lang=ui_lang,
+                ),
+                label="Discussions ({0})".format(source_label),
+                location_headers=location_headers,
+            )
+            items = _normalize_result_items(data.get("web"), "discussions")
+            for item in items:
+                item["source"] = source_label
+                item["site"] = site
+                item["discussion_query"] = query
+            discussions.extend(items)
+        except Exception as exc:  # Category-level partial failure is displayed in the UI.
+            errors["discussions:{0}".format(site)] = str(exc)
+
+    news_items: List[Dict[str, Any]] = []
+    try:
+        news_raw = _brave_get(
+            "/res/v1/news/search",
+            api_key,
+            _news_search_params(
+                keyword,
+                top_n,
+                country=country,
+                search_lang=search_lang,
+                ui_lang=ui_lang,
+            ),
+            label="News Search",
+            location_headers=location_headers,
+        )
+        news_items = _normalize_result_items(news_raw.get("results"), "news")[:top_n]
+    except Exception as exc:
+        errors["news"] = str(exc)
+
+    video_items: List[Dict[str, Any]] = []
+    try:
+        videos_raw = _brave_get(
+            "/res/v1/videos/search",
+            api_key,
+            _video_search_params(
+                keyword,
+                top_n,
+                country=country,
+                search_lang=search_lang,
+                ui_lang=ui_lang,
+            ),
+            label="Videos Search",
+            location_headers=location_headers,
+        )
+        video_items = _normalize_result_items(videos_raw.get("results"), "videos")[:top_n]
+    except Exception as exc:
+        errors["videos"] = str(exc)
+
+    suggestion_items: List[Dict[str, Any]] = []
+    suggest_params: Dict[str, Any] = {
+        "q": keyword,
+        "country": country,
+        "lang": search_lang,
+        "count": min(max(top_n, 1), 20),
+        "rich": True,
+    }
+    try:
+        suggest_raw = _brave_get(
+            "/res/v1/suggest/search",
+            api_key,
+            suggest_params,
+            label="Suggest",
+            location_headers=location_headers,
+        )
+        suggestion_items = _normalize_suggestions(suggest_raw.get("results"))
+    except Exception as rich_exc:
+        # rich=true requires a compatible Autosuggest plan. Fall back so plain suggestions can still display.
+        try:
+            fallback_params = dict(suggest_params)
+            fallback_params["rich"] = False
+            suggest_raw = _brave_get(
+                "/res/v1/suggest/search",
+                api_key,
+                fallback_params,
+                label="Suggest fallback",
+                location_headers=location_headers,
+            )
+            suggestion_items = _normalize_suggestions(suggest_raw.get("results"))
+            warnings["suggestion"] = (
+                "rich=true request failed and plain Suggestion was used instead: {0}".format(
+                    rich_exc
+                )
+            )
+        except Exception as fallback_exc:
+            errors["suggestion"] = "{0} | fallback: {1}".format(rich_exc, fallback_exc)
+
+    return {
+        "web": web_items,
+        "discussions": discussions,
+        "news": news_items,
+        "videos": video_items,
+        "suggestion": suggestion_items,
+        "query": web_raw.get("query") or {},
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def _extract_page_details(
+    rank: int, item: Dict[str, Any], timeout: float = 15.0
+) -> Dict[str, Any]:
+    """Web結果URLからH2/H3を取得し、既存のインジェクション検査を適用する。"""
     url = item.get("url", "")
-    result = {
+    result: Dict[str, Any] = {
+        **item,
         "rank": rank,
         "url": url,
-        "title": item.get("title"),
-        "snippet": item.get("snippet", ""),
         "headings": {"h2": [], "h3": []},
         "fetch_error": False,
         "blocked_count": 0,
         "notes": [],
+        "eligible_for_analysis": False,
     }
     if not url:
         result["fetch_error"] = True
@@ -131,7 +607,7 @@ def _extract_page_details(rank: int, item: dict[str, Any], timeout: float = 15.0
             user_agent="ictGrowthHacker-SerpFetcher/1.0",
             timeout=timeout,
         )
-        result["title"] = title or result["title"]
+        result["title"] = title or result.get("title")
         result["headings"] = {"h2": h2, "h3": h3}
         result["notes"].extend(notes)
         payload_hits = fetch_serp.count_payload_hits(h2) + fetch_serp.count_payload_hits(h3)
@@ -139,282 +615,15 @@ def _extract_page_details(rank: int, item: dict[str, Any], timeout: float = 15.0
             result["blocked_count"] = payload_hits
             result["headings"] = {"h2": [], "h3": []}
             result["notes"].append("injection_suspected")
+        else:
+            result["eligible_for_analysis"] = True
     except Exception as exc:
         result["fetch_error"] = True
-        result["notes"].append(f"fetch_error:{type(exc).__name__}:{exc}")
+        result["notes"].append(
+            "fetch_error:{0}:{1}".format(type(exc).__name__, str(exc))
+        )
     return result
 
-
-def _as_list(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, dict):
-        for key in ("results", "items", "data"):
-            if isinstance(value.get(key), list):
-                return value[key]
-        return [value]
-    return []
-
-
-def _clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return re.sub(r"<[^>]+>", "", str(value)).strip()
-
-
-def _first_value(item: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = item.get(key)
-        if value not in (None, "", [], {}):
-            return value
-    return ""
-
-
-def _normalize_result_items(section: Any, category: str) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for index, raw in enumerate(_as_list(section), 1):
-        if not isinstance(raw, dict):
-            raw = {"text": raw}
-        title = _clean_text(_first_value(raw, "title", "question", "name", "query"))
-        description = _clean_text(
-            _first_value(raw, "description", "answer", "snippet", "text", "long_desc")
-        )
-        url = _clean_text(_first_value(raw, "url", "link", "source_url"))
-        source = _clean_text(
-            _first_value(raw, "source", "profile", "forum_name", "publisher", "site_name")
-        )
-        age = _clean_text(_first_value(raw, "age", "page_age", "published", "date"))
-        item = {
-            "rank": index,
-            "category": category,
-            "title": title,
-            "url": url,
-            "snippet": description,
-            "source": source,
-            "age": age,
-            "raw": raw,
-        }
-        normalized.append(item)
-    return normalized
-
-
-def _normalize_suggestions(section: Any) -> list[dict[str, Any]]:
-    """Autosuggest API の results をSuggestionとして正規化する。"""
-    normalized: list[dict[str, Any]] = []
-    for index, raw in enumerate(_as_list(section), 1):
-        if not isinstance(raw, dict):
-            raw = {"query": raw}
-        normalized.append({
-            "rank": index,
-            "query": _clean_text(raw.get("query")),
-            "title": _clean_text(_first_value(raw, "title", "query", "name")),
-            "description": _clean_text(_first_value(raw, "description", "subtitle", "summary")),
-            "image": _clean_text(_first_value(raw, "img", "image", "thumbnail")),
-            "raw": raw,
-        })
-    return normalized
-
-
-def _brave_get(
-    endpoint: str,
-    api_key: str,
-    params: dict[str, Any],
-    *,
-    label: str,
-) -> dict[str, Any]:
-    if not api_key:
-        raise ValueError("Brave Search API Keyを入力してください。")
-    headers = {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": api_key,
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/134.0.0.0 Safari/537.36"
-        ),
-    }
-    url = f"https://api.search.brave.com{endpoint}"
-    response = httpx.get(url, headers=headers, params=params, timeout=30.0)
-    if response.status_code != 200:
-        raise RuntimeError(f"Brave {label} API error {response.status_code}: {response.text}")
-    return response.json()
-
-
-def _web_search_params(
-    keyword: str,
-    top_n: int,
-    *,
-    country: str,
-    search_lang: str,
-    ui_lang: str,
-) -> dict[str, Any]:
-    return {
-        "q": keyword,
-        "country": country,
-        "search_lang": search_lang,
-        "ui_lang": ui_lang,
-        "count": min(max(top_n, 1), 20),
-        "offset": 0,
-        "safesearch": "moderate",
-        "spellcheck": "true",
-        "text_decorations": "false",
-        "extra_snippets": "true",
-        "operators": "true",
-    }
-
-
-def _news_search_params(
-    keyword: str,
-    top_n: int,
-    *,
-    country: str,
-    search_lang: str,
-    ui_lang: str,
-) -> dict[str, Any]:
-    # News Searchで公式に利用できるパラメータだけを送信する。
-    return {
-        "q": keyword,
-        "country": country,
-        "search_lang": search_lang,
-        "ui_lang": ui_lang,
-        "count": min(max(top_n, 1), 50),
-        "offset": 0,
-        "safesearch": "moderate",
-        "spellcheck": "true",
-        "extra_snippets": "true",
-        "operators": "true",
-    }
-
-
-def _video_search_params(
-    keyword: str,
-    top_n: int,
-    *,
-    country: str,
-    search_lang: str,
-    ui_lang: str,
-) -> dict[str, Any]:
-    # Video SearchにはWeb専用のtext_decorations/extra_snippetsを送信しない。
-    return {
-        "q": keyword,
-        "country": country,
-        "search_lang": search_lang,
-        "ui_lang": ui_lang,
-        "count": min(max(top_n, 1), 50),
-        "offset": 0,
-        "safesearch": "moderate",
-        "spellcheck": "true",
-        "operators": "true",
-    }
-
-
-def _search_brave(
-    keyword: str,
-    api_key: str,
-    top_n: int,
-    *,
-    country: str,
-    search_lang: str,
-    ui_lang: str,
-) -> dict[str, Any]:
-    """用途別エンドポイントを個別実行し、失敗したカテゴリだけエラーとして保持する。"""
-    errors: dict[str, str] = {}
-    raw_response: dict[str, Any] = {}
-
-    web_params = _web_search_params(
-        keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
-    )
-    web_raw = _brave_get("/res/v1/web/search", api_key, web_params, label="Web Search")
-    raw_response["web"] = web_raw
-    web_items = _normalize_result_items(web_raw.get("web"), "web")[:top_n]
-
-    discussion_sites = [
-        ("Reddit", "reddit.com"),
-        ("Yahoo!知恵袋", "chiebukuro.yahoo.co.jp"),
-        ("価格.com掲示板", "bbs.kakaku.com"),
-    ]
-    discussions: list[dict[str, Any]] = []
-    discussion_raw: dict[str, Any] = {}
-    per_site_count = min(max(top_n, 1), 10)
-    for source_label, site in discussion_sites:
-        try:
-            params = _web_search_params(
-                f"{keyword} site:{site}",
-                per_site_count,
-                country=country,
-                search_lang=search_lang,
-                ui_lang=ui_lang,
-            )
-            data = _brave_get(
-                "/res/v1/web/search", api_key, params, label=f"Discussions ({source_label})"
-            )
-            discussion_raw[site] = data
-            items = _normalize_result_items(data.get("web"), "discussions")
-            for item in items:
-                item["source"] = source_label
-                item["site"] = site
-                item["discussion_query"] = params["q"]
-            discussions.extend(items)
-        except Exception as exc:
-            errors[f"discussions:{site}"] = str(exc)
-    raw_response["discussions"] = discussion_raw
-
-    news_items: list[dict[str, Any]] = []
-    try:
-        news_params = _news_search_params(
-            keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
-        )
-        news_raw = _brave_get("/res/v1/news/search", api_key, news_params, label="News Search")
-        raw_response["news"] = news_raw
-        news_items = _normalize_result_items(news_raw.get("results"), "news")[:top_n]
-    except Exception as exc:
-        errors["news"] = str(exc)
-        raw_response["news"] = {}
-
-    video_items: list[dict[str, Any]] = []
-    try:
-        video_params = _video_search_params(
-            keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
-        )
-        videos_raw = _brave_get("/res/v1/videos/search", api_key, video_params, label="Videos Search")
-        raw_response["videos"] = videos_raw
-        video_items = _normalize_result_items(videos_raw.get("results"), "videos")[:top_n]
-    except Exception as exc:
-        errors["videos"] = str(exc)
-        raw_response["videos"] = {}
-
-    suggestion_items: list[dict[str, Any]] = []
-    try:
-        suggest_params = {
-            "q": keyword,
-            "country": country,
-            "count": min(max(top_n, 1), 10),
-            "rich": "true",
-        }
-        suggest_raw = _brave_get(
-            "/res/v1/suggest/search", api_key, suggest_params, label="Autosuggest"
-        )
-        raw_response["suggestion"] = suggest_raw
-        suggestion_items = _normalize_suggestions(suggest_raw.get("results"))
-    except Exception as exc:
-        errors["suggestion"] = str(exc)
-        raw_response["suggestion"] = {}
-
-    return {
-        "web": web_items,
-        "discussions": discussions,
-        "news": news_items,
-        "videos": video_items,
-        "suggestion": suggestion_items,
-        "query": web_raw.get("query") or {},
-        "errors": errors,
-        "raw_response": raw_response,
-    }
 
 def step2_fetch_serp_and_filter(
     keyword: str,
@@ -422,125 +631,154 @@ def step2_fetch_serp_and_filter(
     run_dir: Path,
     *,
     provider: str,
-    credentials: dict[str, str],
+    credentials: Dict[str, Any],
     top_n: int = 8,
-) -> dict:
-    """BraveのWeb・site検索Discussions・News・Videos・Suggestionを取得する。"""
+) -> Dict[str, Any]:
+    """Brave Web / Discussions / News / Videos / Suggestionを取得する。"""
     if provider != "brave":
-        raise ValueError(f"未対応のSERPプロバイダーです: {provider}")
+        raise ValueError("未対応のSERPプロバイダーです: {0}".format(provider))
+
+    search_settings = {
+        "country": credentials.get("country", "JP"),
+        "search_lang": credentials.get("search_lang", "jp"),
+        "ui_lang": credentials.get("ui_lang", "ja-JP"),
+        "location": credentials.get("location", "Tokyo, Japan"),
+        "top_n": top_n,
+    }
+    location_headers = credentials.get("location_headers") or {}
 
     brave_data = _search_brave(
         keyword,
-        credentials.get("api_key", ""),
+        str(credentials.get("api_key", "")),
         top_n,
-        country=credentials.get("country", "JP"),
-        search_lang=credentials.get("search_lang", "jp"),
-        ui_lang=credentials.get("ui_lang", "ja-JP"),
+        country=str(search_settings["country"]),
+        search_lang=str(search_settings["search_lang"]),
+        ui_lang=str(search_settings["ui_lang"]),
+        location_headers=location_headers,
     )
     candidates = brave_data.get("web", [])
     if not candidates:
         raise RuntimeError("Brave Search APIからWeb検索結果を取得できませんでした。")
 
-    raw_results = [_extract_page_details(rank, item) for rank, item in enumerate(candidates, 1)]
-    valid_results = [
+    web_results = [
+        _extract_page_details(rank, item)
+        for rank, item in enumerate(candidates, start=1)
+    ]
+    analysis_web = [
         result
-        for result in raw_results
-        if result.get("blocked_count", 0) == 0 and not result.get("fetch_error", False)
+        for result in web_results
+        if result.get("eligible_for_analysis") and not result.get("blocked_count")
     ]
 
-    serp_data = {
+    serp_data: Dict[str, Any] = {
         "run_id": run_id,
         "keyword": keyword,
         "provider": provider,
-        "search_settings": {
-            "country": credentials.get("country", "JP"),
-            "search_lang": credentials.get("search_lang", "jp"),
-            "ui_lang": credentials.get("ui_lang", "ja-JP"),
-        },
-        "results": valid_results,
-        "web": valid_results,
+        "search_settings": search_settings,
+        "web": web_results,
+        "results": analysis_web,
         "discussions": brave_data.get("discussions", []),
         "news": brave_data.get("news", []),
         "videos": brave_data.get("videos", []),
-        "suggestion": brave_data.get("suggestion", {}),
+        "suggestion": brave_data.get("suggestion", []),
         "query": brave_data.get("query", {}),
+        "errors": brave_data.get("errors", {}),
+        "warnings": brave_data.get("warnings", {}),
         "diagnostics": {
-            "raw_web_count": len(raw_results),
-            "valid_web_count": len(valid_results),
-            "failed_web_count": sum(bool(r.get("fetch_error")) for r in raw_results),
-            "blocked_web_count": sum(bool(r.get("blocked_count", 0)) for r in raw_results),
+            "web_count": len(web_results),
+            "web_heading_count": len(analysis_web),
+            "web_fetch_error_count": sum(bool(r.get("fetch_error")) for r in web_results),
+            "web_blocked_count": sum(bool(r.get("blocked_count")) for r in web_results),
             "discussions_count": len(brave_data.get("discussions", [])),
             "news_count": len(brave_data.get("news", [])),
             "videos_count": len(brave_data.get("videos", [])),
             "suggestion_count": len(brave_data.get("suggestion", [])),
         },
     }
-    (run_dir / "03-serp.json").write_text(
-        json.dumps(serp_data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
 
-    if not valid_results:
-        raise RuntimeError(
-            "Web順位URLは取得できましたが、本文の見出しを取得できるページがありませんでした。"
-            "対象サイト側のアクセス制限を確認してください。"
-        )
+    path = run_dir / "02-serp.json"
+    path.write_text(json.dumps(serp_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "serp-researched",
+        search_settings=search_settings,
+        serp=serp_data["diagnostics"],
+        artifacts={**_read_manifest(run_dir).get("artifacts", {}), "serp": str(path)},
+    )
     return serp_data
 
-def _category_lines(items: list[dict[str, Any]], limit: int = 12) -> list[str]:
-    lines: list[str] = []
+
+# ---------------------------------------------------------------------------
+# Evidence preparation and AI analysis
+# ---------------------------------------------------------------------------
+
+
+def _category_lines(items: List[Dict[str, Any]], limit: int = 12) -> List[str]:
+    lines: List[str] = []
     for item in items[:limit]:
-        title = item.get("title") or item.get("question") or "(タイトルなし)"
-        snippet = item.get("snippet") or item.get("answer") or ""
+        title = item.get("title") or "(タイトルなし)"
+        snippet = item.get("snippet") or ""
+        source = item.get("source") or ""
         url = item.get("url") or ""
-        lines.append(f"- {title}\n  - 概要: {snippet}\n  - URL: {url}")
+        lines.append("- タイトル: {0}".format(title))
+        if snippet:
+            lines.append("  - スニペット: {0}".format(snippet))
+        if source:
+            lines.append("  - 出典: {0}".format(source))
+        if url:
+            lines.append("  - URL: {0}".format(url))
     return lines or ["- 該当結果なし"]
 
 
-def build_serp_summary(serp_data: dict) -> str:
-    lines = ["# Brave SERP Research"]
-    lines.extend(["", "## Web：競合分析・構成"])
-    for result in serp_data.get("web", serp_data.get("results", [])):
+def build_serp_summary(serp_data: Dict[str, Any]) -> str:
+    lines: List[str] = ["# Brave SERP Research", "", "## Web：競合分析・構成"]
+    for result in serp_data.get("web", []):
         headings = result.get("headings", {})
-        lines.append(
-            "\n".join(
-                [
-                    f"順位: {result.get('rank')}",
-                    f"タイトル: {result.get('title') or '(タイトルなし)'}",
-                    f"URL: {result.get('url')}",
-                    f"概要: {result.get('snippet', '')}",
-                    f"H2: {json.dumps(headings.get('h2', []), ensure_ascii=False)}",
-                    f"H3: {json.dumps(headings.get('h3', []), ensure_ascii=False)}",
-                ]
-            )
+        lines.extend(
+            [
+                "",
+                "### {0}. {1}".format(
+                    result.get("rank"), result.get("title") or "(タイトルなし)"
+                ),
+                "- URL: {0}".format(result.get("url", "")),
+                "- 概要: {0}".format(result.get("snippet", "")),
+                "- H2: {0}".format(json.dumps(headings.get("h2", []), ensure_ascii=False)),
+                "- H3: {0}".format(json.dumps(headings.get("h3", []), ensure_ascii=False)),
+                "- 取得状態: {0}".format(
+                    "利用可"
+                    if result.get("eligible_for_analysis")
+                    else "; ".join(result.get("notes", [])) or "見出しなし"
+                ),
+            ]
         )
+
     lines.extend(["", "## Discussions：ユーザーの本音・Pain Point"])
     lines.extend(_category_lines(serp_data.get("discussions", [])))
     lines.extend(["", "## News：鮮度・更新性・最新情報・変更点"])
     lines.extend(_category_lines(serp_data.get("news", [])))
     lines.extend(["", "## Videos：体験・理解促進・手順・比較・実演"])
     lines.extend(_category_lines(serp_data.get("videos", [])))
-    suggestions = serp_data.get("suggestion") or []
     lines.extend(["", "## Suggestion：検索候補"])
+    suggestions = serp_data.get("suggestion", [])
     if suggestions:
-        for item in suggestions[:10]:
-            lines.extend([
-                f"- 名称: {item.get('title') or item.get('query', '')}",
-                                f"  - 説明: {item.get('description', '')}",
-            ])
+        for item in suggestions[:20]:
+            lines.append("- {0}".format(item.get("query") or item.get("title") or ""))
+            if item.get("description"):
+                lines.append("  - 説明: {0}".format(item["description"]))
     else:
         lines.append("- 該当結果なし")
     return "\n".join(lines)
 
-def analyze_serp(serp_data: dict) -> str:
-    """AI分析前の根拠データをPythonで集計・Markdown化する。
 
-    H2/H3の取得自体はstep2内のページ取得処理で行い、この関数では頻度集計と
-    Discussions / News / Videos / Suggestionの入力整理を担当する。
-    """
-    results = serp_data.get("web", serp_data.get("results", []))
+def analyze_serp(serp_data: Dict[str, Any]) -> str:
+    """AI分析前の根拠データをPythonで集計・Markdown化する。"""
+    web_results = serp_data.get("web", [])
     h2_counter: Counter[str] = Counter()
     h3_counter: Counter[str] = Counter()
-    for result in results:
+
+    for result in web_results:
+        if not result.get("eligible_for_analysis"):
+            continue
         headings = result.get("headings", {})
         for heading in headings.get("h2", []):
             normalized = re.sub(r"\s+", " ", str(heading)).strip()
@@ -551,54 +789,77 @@ def analyze_serp(serp_data: dict) -> str:
             if normalized:
                 h3_counter[normalized] += 1
 
-    lines = [
+    lines: List[str] = [
         "# SERP Analysis Evidence",
         "",
-        f"## Web evidence（取得 {len(results)}件）",
+        "## Web evidence",
+        "",
+        "- Web結果件数: {0}".format(len(web_results)),
+        "- H2/H3取得成功件数: {0}".format(
+            sum(bool(r.get("eligible_for_analysis")) for r in web_results)
+        ),
         "",
         "### 頻出H2",
     ]
     lines.extend(
-        [f"- {title}（{count}ページ）" for title, count in h2_counter.most_common(20)]
+        ["- {0}（{1}ページ）".format(title, count) for title, count in h2_counter.most_common(25)]
         or ["- 抽出できませんでした"]
     )
     lines.extend(["", "### 頻出H3"])
     lines.extend(
-        [f"- {title}（{count}ページ）" for title, count in h3_counter.most_common(25)]
+        ["- {0}（{1}ページ）".format(title, count) for title, count in h3_counter.most_common(30)]
         or ["- 抽出できませんでした"]
     )
 
-    categories = [
+    lines.extend(["", "### ページ別タイトル・スニペット・見出し"])
+    for result in web_results[:20]:
+        lines.append(
+            "- {0}. {1}".format(result.get("rank"), result.get("title") or "(タイトルなし)")
+        )
+        lines.append("  - スニペット: {0}".format(result.get("snippet", "")))
+        if result.get("eligible_for_analysis"):
+            headings = result.get("headings", {})
+            lines.append(
+                "  - H2: {0}".format(json.dumps(headings.get("h2", []), ensure_ascii=False))
+            )
+            lines.append(
+                "  - H3: {0}".format(json.dumps(headings.get("h3", []), ensure_ascii=False))
+            )
+        else:
+            lines.append(
+                "  - 見出し取得状態: {0}".format(
+                    "; ".join(result.get("notes", [])) or "取得なし"
+                )
+            )
+
+    for heading, key in (
         ("Discussions evidence", "discussions"),
         ("News evidence", "news"),
         ("Videos evidence", "videos"),
-    ]
-    for heading, key in categories:
+    ):
         items = serp_data.get(key, [])
-        lines.extend(["", f"## {heading}（取得 {len(items)}件）"])
-        if items:
-            for item in items[:15]:
-                title = item.get("title") or item.get("question") or "(タイトルなし)"
-                snippet = item.get("snippet") or item.get("answer") or ""
-                source = item.get("source") or ""
-                lines.append(f"- タイトル: {title}")
-                lines.append(f"  - スニペット: {snippet}")
-                if source:
-                    lines.append(f"  - 出典: {source}")
-        else:
-            lines.append("- 該当結果なし")
+        lines.extend(["", "## {0}（取得 {1}件）".format(heading, len(items))])
+        lines.extend(_category_lines(items, limit=20))
 
-    suggestions = serp_data.get("suggestion") or []
-    lines.extend(["", f"## Suggestion evidence（取得 {len(suggestions)}件）"])
+    suggestions = serp_data.get("suggestion", [])
+    lines.extend(["", "## Suggestion evidence（取得 {0}件）".format(len(suggestions))])
     if suggestions:
         for item in suggestions[:20]:
             query = item.get("query") or item.get("title") or "(候補なし)"
-            description = item.get("description") or ""
-            lines.append(f"- 検索候補: {query}")
-            if description:
-                lines.append(f"  - 説明: {description}")
+            lines.append("- 検索候補: {0}".format(query))
+            if item.get("description"):
+                lines.append("  - 説明: {0}".format(item["description"]))
     else:
         lines.append("- 該当結果なし")
+
+    errors = serp_data.get("errors", {})
+    warnings = serp_data.get("warnings", {})
+    if errors or warnings:
+        lines.extend(["", "## Retrieval limitations"])
+        for key, message in warnings.items():
+            lines.append("- Warning ({0}): {1}".format(key, message))
+        for key, message in errors.items():
+            lines.append("- Error ({0}): {1}".format(key, message))
 
     return "\n".join(lines)
 
@@ -606,173 +867,624 @@ def analyze_serp(serp_data: dict) -> str:
 def step2_generate_analysis(
     llm: LLMService,
     keyword: str,
-    serp_data: dict,
+    serp_data: Dict[str, Any],
     run_dir: Path,
 ) -> str:
-    """Pythonで整理したSERP根拠をanalysis-prompt.mdに従ってAI分析する。"""
     analysis_prompt = load_prompt_file("analysis-prompt.md")
+    data_rules = load_prompt_file("data-integrity.md")
     if not analysis_prompt.strip():
         raise FileNotFoundError(
             "analysis-prompt.mdが見つかりません。referencesに配置してください。"
         )
 
     evidence = analyze_serp(serp_data)
-    (run_dir / "04-analysis-evidence.md").write_text(evidence, encoding="utf-8")
+    evidence_path = run_dir / "03-analysis-evidence.md"
+    evidence_path.write_text(evidence, encoding="utf-8")
 
-    user_prompt = f"""
+    system_prompt = "{0}\n\n# Data Integrity\n{1}".format(analysis_prompt, data_rules)
+    user_prompt = """
 対策キーワード: {keyword}
 
 以下はPythonで取得・集計したSERP根拠データです。
-記載されていない内容を推測で補わず、analysis-prompt.mdの形式で分析してください。
+記載されていない内容を推測で補わず、指定形式で分析してください。
 
 {evidence}
-"""
-    analysis = llm.generate(analysis_prompt, user_prompt)
-    (run_dir / "05-serp-analysis.md").write_text(analysis, encoding="utf-8")
+""".format(keyword=keyword, evidence=evidence)
+    analysis = llm.generate(system_prompt, user_prompt, temperature=0.3)
+    analysis_path = run_dir / "04-analysis.md"
+    analysis_path.write_text(analysis, encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "analysis-ready",
+        artifacts={
+            **_read_manifest(run_dir).get("artifacts", {}),
+            "analysis_evidence": str(evidence_path),
+            "analysis": str(analysis_path),
+        },
+    )
     return analysis
+
+
+# ---------------------------------------------------------------------------
+# Outline, originality, article and fact-check
+# ---------------------------------------------------------------------------
+
+
+def _ensure_outline_ids(outline: str) -> str:
+    """Assign deterministic sequential IDs to every generated H2 section."""
+    lines = outline.splitlines()
+    next_id = 1
+    output: List[str] = []
+    for line in lines:
+        if re.match(r"^##\s+", line):
+            line = re.sub(
+                r"\s*\[id:\s*h2-[^\]]+\]\s*$",
+                "",
+                line,
+                flags=re.IGNORECASE,
+            ).rstrip()
+            line = "{0} [id: h2-{1:02d}]".format(line, next_id)
+            next_id += 1
+        output.append(line)
+    return "\n".join(output).strip()
+
 
 def step3_generate_outline(
     llm: LLMService,
     keyword: str,
-    serp_data: dict,
+    serp_data: Dict[str, Any],
     run_dir: Path,
     serp_analysis: str = "",
+    owned_site_url: str = "",
+    cta_url: str = "",
 ) -> str:
-    sop_rules = load_prompt_file("sop.md")
-    system_prompt = f"""
-あなたはプロのSEOコンサルタントです。以下のSOPのStep 4に従って構成案を作成してください。
+    outline_prompt = load_prompt_file("outline-prompt.md")
+    sop_rules = load_sop_step("Step 4")
+    data_rules = load_prompt_file("data-integrity.md")
+    if not outline_prompt.strip():
+        raise FileNotFoundError(
+            "outline-prompt.mdが見つかりません。referencesに配置してください。"
+        )
 
-【SOPルール】
+    system_prompt = """
+{outline_prompt}
+
+# Workflow Rules
 {sop_rules}
 
-【対策キーワード】
+# Data Integrity
+{data_rules}
+""".format(
+        outline_prompt=outline_prompt,
+        sop_rules=sop_rules,
+        data_rules=data_rules,
+    )
+    user_prompt = """
+対策キーワード:
 {keyword}
 
-【SERP横断分析】
-{serp_analysis}
+SERP横断分析:
+{analysis}
 
-【競合SERP生データ】
-{build_serp_summary(serp_data)}
+SERP根拠の要約:
+{summary}
 
-出力はMarkdown形式とし、各H2には必ず [id: h2-01] の形式でIDを付与してください。
-"""
-    outline = llm.generate(system_prompt)
-    (run_dir / "04-outline.md").write_text(outline, encoding="utf-8")
+Owned Site URL:
+{owned_site_url}
+
+CTA URL:
+{cta_url}
+
+Owned Site URLは記事内で自然に案内する対象です。ただし、URL文字列だけからサービス内容、実績、価格、機能を推測しないでください。
+CTA URLが「(未入力)」の場合は、リンク付きCTAを構成に入れないでください。
+""".format(
+        keyword=keyword,
+        analysis=serp_analysis,
+        summary=build_serp_summary(serp_data),
+        owned_site_url=owned_site_url or "(未入力)",
+        cta_url=cta_url or "(未入力)",
+    )
+    outline = _ensure_outline_ids(llm.generate(system_prompt, user_prompt, temperature=0.5))
+    if not re.search(r"^##\s+", outline, flags=re.MULTILINE):
+        raise RuntimeError("構成案にH2見出しがありません。")
+    save_outline(run_dir, outline)
     return outline
+
+
+def _parse_json_array(raw: str) -> List[Any]:
+    stripped = raw.strip()
+    stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*\]", stripped, flags=re.DOTALL)
+        if not match:
+            raise RuntimeError("AI応答からJSON配列を抽出できませんでした。")
+        value = json.loads(match.group(0))
+    if not isinstance(value, list):
+        raise RuntimeError("AI応答がJSON配列ではありません。")
+    return value
 
 
 def step4_propose_originality(
     llm: LLMService,
     keyword: str,
-    serp_data: dict,
+    serp_data: Dict[str, Any],
     outline: str,
     run_dir: Path,
     serp_analysis: str = "",
-) -> list[dict[str, str]]:
+    owned_site_url: str = "",
+) -> List[Dict[str, str]]:
     system_prompt = load_prompt_file("originality-prompt.md")
+    data_rules = load_prompt_file("data-integrity.md")
     if not system_prompt.strip():
         raise FileNotFoundError(
             "originality-prompt.mdが見つかりません。referencesに配置してください。"
         )
-    user_prompt = f"""
+    user_prompt = """
 対策キーワード: {keyword}
 
 SERP横断分析:
-{serp_analysis}
+{analysis}
 
-競合SERP生データ:
-{build_serp_summary(serp_data)}
+競合SERP根拠:
+{summary}
 
 現在の構成案:
 {outline}
-"""
-    raw = llm.generate(system_prompt, user_prompt)
-    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-    if not match:
-        raise RuntimeError("独自性提案をJSONとして解析できませんでした。")
-    proposals = json.loads(match.group(0))
-    if not isinstance(proposals, list) or len(proposals) < 3:
-        raise RuntimeError("独自性提案が3件生成されませんでした。")
+
+Owned Site URL:
+{owned_site_url}
+
+Owned Site URLは独自性の方向性を考える対象ですが、URLだけを根拠にサービス内容、実績、価格、機能を推測しないでください。
+
+データ整合性ルール:
+{data_rules}
+""".format(
+        keyword=keyword,
+        analysis=serp_analysis,
+        summary=build_serp_summary(serp_data),
+        outline=outline,
+        owned_site_url=owned_site_url or "(未入力)",
+        data_rules=data_rules,
+    )
+    parsed = _parse_json_array(llm.generate(system_prompt, user_prompt, temperature=0.6))
+    proposals: List[Dict[str, str]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        proposal = {
+            "title": str(item.get("title", "")).strip(),
+            "description": str(item.get("description", "")).strip(),
+            "placement": str(item.get("placement", "")).strip(),
+        }
+        if all(proposal.values()):
+            proposals.append(proposal)
+    if len(proposals) < 3:
+        raise RuntimeError("独自性提案が有効な形式で3件生成されませんでした。")
     proposals = proposals[:3]
-    (run_dir / "05-originality-proposals.json").write_text(
-        json.dumps(proposals, ensure_ascii=False, indent=2), encoding="utf-8"
+
+    path = run_dir / "06-originality-proposals.json"
+    path.write_text(json.dumps(proposals, ensure_ascii=False, indent=2), encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "originality-proposed",
+        artifacts={
+            **_read_manifest(run_dir).get("artifacts", {}),
+            "originality_proposals": str(path),
+        },
     )
     return proposals
+
+
+def _parse_outline_sections(outline: str) -> List[Tuple[str, str, str]]:
+    sections: List[Tuple[str, str, str]] = []
+    matches = list(re.finditer(r"^##\s+(.+)$", outline, flags=re.MULTILINE))
+    for index, match in enumerate(matches):
+        heading_line = match.group(1).strip()
+        id_match = re.search(r"\[id:\s*(h2-\d+)\]", heading_line, flags=re.IGNORECASE)
+        h2_id = id_match.group(1).lower() if id_match else "h2-{0:02d}".format(index + 1)
+        title = re.sub(r"\s*\[id:\s*h2-\d+\]\s*$", "", heading_line, flags=re.IGNORECASE)
+        title = re.sub(r"^H2[-\s]*\d+\s*[:：]\s*", "", title, flags=re.IGNORECASE).strip()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(outline)
+        block = outline[match.start():end].strip()
+        sections.append((title, h2_id, block))
+    return sections
+
+
+def _extract_outline_field(outline: str, labels: Sequence[str]) -> str:
+    """Extract a one-line metadata value from the approved outline."""
+    for label in labels:
+        escaped = re.escape(label)
+        patterns = (
+            r"^-\s*{0}\s*[:：]\s*(.+)$".format(escaped),
+            r"^\*\*{0}\*\*\s*[:：]\s*(.+)$".format(escaped),
+            r"^{0}\s*[:：]\s*(.+)$".format(escaped),
+        )
+        for pattern in patterns:
+            match = re.search(pattern, outline, flags=re.MULTILINE | re.IGNORECASE)
+            if match:
+                value = match.group(1).strip()
+                if value:
+                    return value
+    return ""
+
+
+def _extract_article_title(outline: str, keyword: str) -> str:
+    h1 = _extract_outline_field(outline, ("H1",))
+    if h1:
+        return h1
+
+    for match in re.finditer(r"^#\s+(.+)$", outline, flags=re.MULTILINE):
+        title = match.group(1).strip()
+        if "構成案" not in title:
+            return title
+    return "{0}のSEO記事".format(keyword)
+
+
+def _extract_meta_title(outline: str, article_title: str) -> str:
+    return _extract_outline_field(
+        outline,
+        ("Meta Title", "SEO Title", "Title", "メタタイトル"),
+    ) or article_title
+
+
+def _extract_meta_description(outline: str, keyword: str) -> str:
+    description = _extract_outline_field(
+        outline,
+        ("Meta Description", "Description", "メタディスクリプション"),
+    )
+    if description:
+        return description
+    return "{0}について、検索意図に沿って要点、比較、注意点、具体的な進め方を解説します。".format(
+        keyword
+    )
+
+
+def _build_article_frontmatter(title: str, description: str) -> str:
+    """Build YAML-compatible front matter using JSON-escaped scalar values."""
+    return "---\ntitle: {0}\ndescription: {1}\n---\n\n".format(
+        json.dumps(title, ensure_ascii=False),
+        json.dumps(description, ensure_ascii=False),
+    )
+
+
+def _extract_key_takeaways(outline: str) -> List[str]:
+    """Extract the Key Takeaways block designed by the outline prompt."""
+    lines = outline.splitlines()
+    start: Optional[int] = None
+    for index, line in enumerate(lines):
+        normalized = re.sub(r"[>*#\s]", "", line).lower()
+        if normalized.startswith("keytakeaways"):
+            start = index + 1
+            break
+    if start is None:
+        return []
+
+    takeaways: List[str] = []
+    for line in lines[start:]:
+        if re.match(r"^##\s+", line):
+            break
+        match = re.match(r"^\s*>?\s*[-*]\s+(.+?)\s*$", line)
+        if match:
+            takeaways.append(match.group(1).strip())
+        elif takeaways and line.strip() and not line.lstrip().startswith(">"):
+            break
+    return takeaways[:5]
+
+
+def _find_owned_site_target(
+    sections: Sequence[Tuple[str, str, str]], owned_site_url: str
+) -> int:
+    if not owned_site_url:
+        return -1
+
+    explicit: List[int] = []
+    likely: List[int] = []
+    for index, (title, _h2_id, block) in enumerate(sections):
+        role_match = re.search(
+            r"owned site role\s*[:：]\s*([^\n]+)", block, re.IGNORECASE
+        )
+        if role_match:
+            role_value = role_match.group(1).strip().lower()
+            if role_value not in ("なし", "none", "不要", "n/a", "na"):
+                explicit.append(index)
+        title_lower = title.lower()
+        if any(
+            token in title_lower
+            for token in ("公式", "サービス", "相談", "支援", "次の行動", "詳細", "owned site")
+        ):
+            likely.append(index)
+
+    if explicit:
+        return explicit[-1]
+    if likely:
+        return likely[-1]
+    for index in range(len(sections) - 1, -1, -1):
+        title = sections[index][0]
+        if "faq" not in title.lower() and "よくある質問" not in title:
+            return index
+    return len(sections) - 1
+
+
+def _find_cta_target(
+    sections: Sequence[Tuple[str, str, str]], cta_url: str
+) -> int:
+    if not cta_url:
+        return -1
+
+    explicit: List[int] = []
+    owned_site_sections: List[int] = []
+    summary_sections: List[int] = []
+    for index, (title, _h2_id, block) in enumerate(sections):
+        block_lower = block.lower()
+        title_lower = title.lower()
+        cta_match = re.search(
+            r"cta(?: placement)?\s*[:：]\s*([^\n]+)", block, re.IGNORECASE
+        )
+        if cta_match:
+            cta_value = cta_match.group(1).strip().lower()
+            if cta_value not in ("なし", "none", "不要", "n/a", "na"):
+                explicit.append(index)
+        if "owned site role" in block_lower and not re.search(
+            r"owned site role\s*[:：]\s*(?:なし|none|不要)", block, re.IGNORECASE
+        ):
+            owned_site_sections.append(index)
+        if any(token in title_lower for token in ("まとめ", "結論", "next action", "次の行動", "相談", "サービス")):
+            summary_sections.append(index)
+
+    if explicit:
+        return explicit[-1]
+    if owned_site_sections:
+        return owned_site_sections[-1]
+    if summary_sections:
+        return summary_sections[-1]
+    for index in range(len(sections) - 1, -1, -1):
+        if "faq" not in sections[index][0].lower() and "よくある質問" not in sections[index][0]:
+            return index
+    return len(sections) - 1
+
+
+def _find_originality_target(
+    sections: Sequence[Tuple[str, str, str]], originality: Dict[str, str]
+) -> int:
+    placement = originality.get("placement", "").lower()
+    for index, (title, h2_id, _block) in enumerate(sections):
+        if h2_id.lower() in placement or title.lower() in placement:
+            return index
+    return 0
+
+
+def _strip_duplicate_heading(section: str, title: str) -> str:
+    lines = section.strip().splitlines()
+    if lines and re.match(r"^##\s+", lines[0]):
+        candidate = re.sub(r"^##\s+", "", lines[0]).strip()
+        if candidate.lower() == title.lower() or title.lower() in candidate.lower():
+            lines = lines[1:]
+    return "\n".join(lines).strip()
 
 
 def step5_generate_sections_and_assemble(
     llm: LLMService,
     keyword: str,
     outline: str,
-    originality: dict[str, str],
+    originality: Dict[str, str],
     run_dir: Path,
     serp_analysis: str = "",
+    owned_site_url: str = "",
+    cta_url: str = "",
 ) -> str:
     article_prompt = load_prompt_file("article-prompt.md")
     style_rules = load_prompt_file("writing-style.md")
     data_rules = load_prompt_file("data-integrity.md")
+    sop_rules = load_sop_step("Step 6")
     if not article_prompt.strip():
         raise FileNotFoundError(
             "article-prompt.mdが見つかりません。referencesに配置してください。"
         )
 
-    h2_matches = re.findall(r"##\s+(.*?)\s+\[id:\s*(h2-\d+)\]", outline)
-    if not h2_matches:
-        h2_matches = [
-            (line.replace("## ", "").strip(), f"h2-{i:02d}")
-            for i, line in enumerate(outline.splitlines(), 1)
-            if line.startswith("## ")
-        ]
+    sections = _parse_outline_sections(outline)
+    if not sections:
+        raise RuntimeError("構成案からH2セクションを取得できませんでした。")
 
-    drafts_dir = run_dir / "06-drafts"
+    drafts_dir = run_dir / "08-drafts"
     drafts_dir.mkdir(exist_ok=True)
-    full_article = f"# {keyword} のSEO記事\n\n"
-    originality_text = json.dumps(originality, ensure_ascii=False)
+    article_title = _extract_article_title(outline, keyword)
+    meta_title = _extract_meta_title(outline, article_title)
+    meta_description = _extract_meta_description(outline, keyword)
+    full_article = _build_article_frontmatter(meta_title, meta_description)
+    full_article += "# {0}\n\n".format(article_title)
+    key_takeaways = _extract_key_takeaways(outline)
+    if key_takeaways:
+        full_article += "> **Key Takeaways**\n"
+        for takeaway in key_takeaways:
+            full_article += "> - {0}\n".format(takeaway)
+        full_article += "\n"
+    target_index = _find_originality_target(sections, originality)
+    originality_core = {
+        field: str(originality.get(field, "")).strip()
+        for field in ("title", "description", "placement")
+    }
+    additional_information = str(
+        originality.get("additional_information", "")
+    ).strip()
+    owned_site_target_index = _find_owned_site_target(sections, owned_site_url)
+    cta_target_index = _find_cta_target(sections, cta_url)
 
-    for h2_title, h2_id in h2_matches:
-        system_prompt = f"""
-【Article Generation専用指示】
+    for index, (h2_title, h2_id, outline_block) in enumerate(sections):
+        if index == target_index:
+            originality_instruction = (
+                "このセクションは選択された独自要素の挿入先です。次の内容を自然に一度だけ反映してください。\n"
+                + json.dumps(originality_core, ensure_ascii=False)
+            )
+            section_additional_information = additional_information
+            if section_additional_information:
+                originality_instruction += (
+                    "\nユーザー追加情報欄の内容も、独自要素を具体化する補足として反映してください。"
+                    "ただし、未検証の主張を客観的事実として断定しないでください。"
+                )
+        else:
+            originality_instruction = (
+                "選択された独自要素とユーザー追加情報は別セクションで扱うため、"
+                "このセクションでは重複して書かないでください。"
+            )
+            section_additional_information = ""
+
+        same_destination = bool(
+            owned_site_url
+            and cta_url
+            and owned_site_url.rstrip("/") == cta_url.rstrip("/")
+            and owned_site_target_index == cta_target_index
+        )
+        if owned_site_url and index == owned_site_target_index:
+            if same_destination:
+                owned_site_instruction = (
+                    "このセクションはOwned SiteとCTAの共通挿入先です。CTAリンク1回で両方の役割を満たし、"
+                    "同じURLへのリンクを重複させないでください。"
+                )
+            else:
+                owned_site_instruction = (
+                    "このセクションはOwned Site URLの案内先です。構成案のOwned Site Roleに沿い、"
+                    "読者の課題とつながる具体的なアンカーテキストでMarkdownリンクを1回だけ入れてください。"
+                )
+        elif owned_site_url:
+            owned_site_instruction = (
+                "Owned Site URLは別セクションで案内するため、このセクションではURLや案内を重複させないでください。"
+            )
+        else:
+            owned_site_instruction = "Owned Site URLは未入力です。リンクや仮URLを作らないでください。"
+
+        if cta_url and index == cta_target_index:
+            if same_destination:
+                cta_instruction = (
+                    "このセクションはCTAの挿入先です。Owned Site案内と共通のMarkdownリンクを1回だけ入れてください。"
+                    "過度な煽りや、根拠のない成果保証は禁止です。"
+                )
+            else:
+                cta_instruction = (
+                    "このセクションはCTAの挿入先です。文脈に合う具体的なアンカーテキストで、"
+                    "CTA URLへのMarkdownリンクを1回だけ入れてください。過度な煽りや、根拠のない成果保証は禁止です。"
+                )
+        elif cta_url:
+            cta_instruction = "CTAは別セクションで扱うため、このセクションにCTA URLや重複CTAを入れないでください。"
+        else:
+            cta_instruction = "CTA URLは未入力です。リンク、仮URL、CTAプレースホルダーを作らないでください。"
+
+        system_prompt = """
+# Article Generation
 {article_prompt}
 
-【執筆スタイル規約】
+# Writing Style
 {style_rules}
 
-【データ整合性ルール】
+# Data Integrity
 {data_rules}
 
-【SERP分析】
-{serp_analysis}
+# Relevant SOP
+{sop_rules}
+""".format(
+            article_prompt=article_prompt,
+            style_rules=style_rules,
+            data_rules=data_rules,
+            sop_rules=sop_rules,
+        )
+        user_prompt = """
+対策キーワード: {keyword}
 
-【全体構成案】
+SERP分析:
+{analysis}
+
+全体構成案:
 {outline}
 
-【選択された独自要素】
-{originality_text}
-"""
-        user_prompt = f"H2見出し「{h2_title}」の本文のみを執筆してください。"
-        section = llm.generate(system_prompt, user_prompt)
-        (drafts_dir / f"{h2_id}.md").write_text(section, encoding="utf-8")
-        full_article += f"## {h2_title}\n{section}\n\n"
-        time.sleep(1)
+今回担当する構成ブロック:
+{outline_block}
 
-    (run_dir / "07-final.md").write_text(full_article, encoding="utf-8")
+独自性の扱い:
+{originality_instruction}
+
+ユーザー追加情報:
+{additional_information}
+
+追加情報の扱い:
+- 追加情報は、選択された独自性を具体化するためのユーザー提供コンテキストです。
+- 意見や主観は、客観的な事実として断定せず、見解・判断軸として自然に反映してください。
+- URLだけからリンク先の内容、実績、機能、価格、調査結果を推測しないでください。
+- 追加情報が空の場合は、存在しない情報を補わないでください。
+
+Owned Site URL:
+{owned_site_url}
+
+CTA URL:
+{cta_url}
+
+Owned Siteの扱い:
+- Owned Site URLを、記事の読者課題と自然につながる案内先として扱ってください。
+- URLだけからサービス内容、価格、機能、実績、対応範囲を推測しないでください。
+- 構成ブロックでOwned Siteの役割が指定された場合のみ、その役割を具体化してください。
+- {owned_site_instruction}
+
+CTAの扱い:
+{cta_instruction}
+
+H2見出し「{h2_title}」の本文だけを執筆してください。
+""".format(
+            keyword=keyword,
+            analysis=serp_analysis,
+            outline=outline,
+            outline_block=outline_block,
+            originality_instruction=originality_instruction,
+            additional_information=section_additional_information or "(このセクションでは使用しない)",
+            owned_site_url=owned_site_url or "(未入力)",
+            cta_url=cta_url or "(未入力)",
+            owned_site_instruction=owned_site_instruction,
+            cta_instruction=cta_instruction,
+            h2_title=h2_title,
+        )
+        section = _strip_duplicate_heading(
+            llm.generate(system_prompt, user_prompt, temperature=0.7), h2_title
+        )
+        if not section:
+            raise RuntimeError("{0}の本文が空でした。".format(h2_id))
+        (drafts_dir / "{0}.md".format(h2_id)).write_text(section, encoding="utf-8")
+        full_article += "## {0}\n\n{1}\n\n".format(h2_title, section)
+        time.sleep(0.5)
+
+    article_path = run_dir / "09-article.md"
+    article_path.write_text(full_article, encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "article-ready",
+        artifacts={
+            **_read_manifest(run_dir).get("artifacts", {}),
+            "drafts": str(drafts_dir),
+            "article": str(article_path),
+        },
+    )
     return full_article
 
 
-def step6_fact_check(
-    llm: LLMService,
-    article: str,
-    run_dir: Path,
-) -> str:
+def step6_fact_check(llm: LLMService, article: str, run_dir: Path) -> str:
     factcheck_prompt = load_prompt_file("factcheck-prompt.md")
     if not factcheck_prompt.strip():
         raise FileNotFoundError(
-            "factcheck-prompt.mdが見つかりません。アプリのルートまたはreferencesに配置してください。"
+            "factcheck-prompt.mdが見つかりません。referencesに配置してください。"
         )
     report = llm.generate(
         factcheck_prompt,
         article,
         use_web_search=True,
+        temperature=0.2,
     )
-    (run_dir / "08-fact-check.md").write_text(report, encoding="utf-8")
+    path = run_dir / "10-fact-check.md"
+    path.write_text(report, encoding="utf-8")
+    update_run_manifest(
+        run_dir,
+        "done",
+        artifacts={
+            **_read_manifest(run_dir).get("artifacts", {}),
+            "fact_check": str(path),
+        },
+    )
     return report

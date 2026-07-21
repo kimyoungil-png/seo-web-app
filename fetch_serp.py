@@ -1,4 +1,4 @@
-﻿"""
+"""
 fetch_serp.py — seo-growth-navigator Skill の唯一の外部 Web 取得経路
 
 設計:
@@ -365,8 +365,8 @@ def _strip_noise(tree: HTMLParser) -> None:
             node.decompose()
 
 
-def _extract_headings(tree: HTMLParser, selector: str) -> list[str]:
-    out: list[str] = []
+def _extract_headings(tree: HTMLParser, selector: str) -> List[str]:
+    out: List[str] = []
     for node in tree.css(selector):
         # nav/header/footer/aside 配下の見出しはノイズが多いので除外
         parent = node.parent
@@ -393,7 +393,7 @@ def fetch_page_headings(
     """1 ページを取得し (title, h2[], h3[], notes[]) を返す。
     通信/パース失敗時は例外を投げる(呼び出し側で notes に詰める)。
     """
-    notes: list[str] = []
+    notes: List[str] = []
     try:
         with httpx.Client(
             timeout=timeout,
@@ -635,7 +635,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # - SERP 取得側 (serp_user_agent) は engine が playwright のとき実ブラウザ偽装が既定
     if args.user_agent is not None:
         page_ua = args.user_agent
-        serp_ua: str | None = args.user_agent
+        serp_ua: Optional[str] = args.user_agent
     else:
         page_ua = _DEFAULT_HTTP_UA
         if args.engine == "playwright":

@@ -1,332 +1,411 @@
-# SEO Growth Hacker — Standard Operating Procedure (SOP)
+# SEO Growth Hacker — Standard Operating Procedure (Streamlit Edition)
 
-旧サブエージェント版 SOP を「**1工程=1コマンド**」に再構成した詳細手順書。
-各 `/seo:*` コマンドの実装者(=コマンド本体の Markdown を書くときの Claude)もこのファイルを参照する。
+このSOPは、旧サブエージェント版の「工程ごとに入力・成果物・停止条件を明確にする」という設計思想を維持しながら、現在のStreamlitアプリの実装に合わせて再構成したものです。
 
 ---
 
 ## 共通前提
 
-- 言語: 出力は**日本語**
-- 実行: 各コマンドは**自分の工程だけ完遂**。次工程に勝手に進まない
-- 永続化先: `.seo/runs/{run_id}/` (詳細は [run-layout.md](run-layout.md))
-- 数値: MCP実数のみ。捏造禁止 (詳細は [data-integrity.md](data-integrity.md))
-- SERP取得: `fetch_serp.py` 経由のみ (詳細は [serp-fallback.md](serp-fallback.md))
-- セキュリティ: インジェクション検知時は即停止 (詳細は [security-model.md](security-model.md))
+- 出力言語は原則として日本語とする。
+- 画面は1ページ構成で、各工程はアコーディオンとして上から順に配置する。
+- 完了した工程は自動的に閉じるが、ユーザーは再度開いて結果を確認・再生成できる。
+- AI処理は`LLMService`を唯一の入口とし、選択したGeminiまたはOpenAIのどちらか一方だけを全工程で使用する。
+- Streamlitの`@st.cache_data`および`@st.cache_resource`は使用しない。
+- 画面状態は`st.session_state`、再現用成果物は`.seo/runs/{run_id}/`へ保存する。
+- APIキーはセッション入力またはStreamlit Secretsから読み込み、成果物や`run.json`には保存しない。
+- 数値・事実は`data-integrity.md`に従い、捏造しない。
+- Webページから取得したH2/H3にインジェクション疑いがある場合、そのページの見出しを分析対象から除外する。
 
 ---
 
-## Step 1 — お宝KW抽出 (`/seo:find-keywords`)
+## Runtime State
+
+旧SOPで中間Markdownファイルとして受け渡していた成果物は、画面上では次の`st.session_state`に保持します。
+
+| 工程 | Runtime State |
+| --- | --- |
+| SERP Research | `serp_data` |
+| Analysis | `serp_analysis` |
+| Outline | `outline` |
+| Originality提案 | `originality_proposals` |
+| Originality選択・追加情報 | `selected_originality`（`additional_information`を含む） |
+| Article | `article` |
+| Fact Check | `fact_check` |
+
+これらは一時的な画面状態ですが、主要成果物は同時にrunディレクトリへ保存します。
+
+---
+
+## Run Layout
+
+実際に生成されるファイルだけを記載します。
+
+```text
+.seo/runs/{run_id}/
+├── run.json
+├── 02-serp.json
+├── 03-analysis-evidence.md
+├── 04-analysis.md
+├── 05-outline.md
+├── 06-originality-proposals.json
+├── 07-selected-originality.json
+├── 08-drafts/
+│   ├── h2-01.md
+│   ├── h2-02.md
+│   └── ...
+├── 09-article.md
+└── 10-fact-check.md
+```
+
+`run.json`には現在のphase、使用モデル、検索設定、成果物パスを記録します。APIキーは記録しません。
+
+---
+
+## Step 1 — Setup
 
 ### 目的
-GA4/GSCの実数からインパクトの大きい改善候補 URL × 想定KWを **1〜3件** 抽出する。
+
+AI、Brave Search API、検索対象地域、対策キーワード、Owned Site URL、任意のCTA URLを確定します。
+
+### 入力
+
+- AI Model
+- Gemini API KeyまたはOpenAI API Key
+- Brave Search API Key
+- Country
+  - Tokyo, Japan
+  - Seoul, South Korea
+  - United States
+- Target Keyword
+- Owned Site URL（必須）
+- CTA URL（任意。空欄でも進行可能）
+
+### ルール
+
+1. 検索言語はCountryに自動連動する。
+   - Tokyo, Japan → `country=JP`, `search_lang=jp`, `ui_lang=ja-JP`
+   - Seoul, South Korea → `country=KR`, `search_lang=ko`, `ui_lang=ko-KR`
+   - United States → `country=US`, `search_lang=en`, `ui_lang=en-US`
+2. AIモデルを変更した場合、異なるプロバイダーの結果が混在しないようSERP Analysis以降をリセットする。
+3. キーワードまたはCountryを変更した場合、SERP以降をリセットする。
+5. Owned Site URLまたはCTA URLを変更した場合、SERPデータは保持し、Outline以降をリセットする。
+6. Owned Site URLは入力必須とし、HTTPまたはHTTPS URLとして解釈できることを確認する。
+7. CTA URLは任意とする。入力された場合だけHTTPまたはHTTPS URLとして検証する。
+8. URL文字列だけからサービス内容、価格、機能、実績を推測しない。
+9. Setup完了後、SERP Researchを開始する時点でrunディレクトリと`run.json`を初期化し、`content_settings`へOwned Site URLとCTA URLを保存する。APIキーは保存しない。
+
+### 完了条件
+
+- Target Keyword、Owned Site URL、AI API Key、Brave Search API Keyが入力済みである。
+- CTA URLは空欄でもよい。入力された場合は有効なHTTP(S) URLである。
+
+---
+
+## Step 2 — SERP Research
+
+### 目的
+
+複数の検索面から記事設計に必要な根拠を取得し、Web上位ページのH2/H3を安全に抽出します。
+
+### Brave APIリクエスト
+
+1. Web
+   - `GET /res/v1/web/search`
+   - 競合分析、タイトル、スニペット、URL取得
+2. Discussions
+   - 専用エンドポイントは使わず、Web Searchを次の検索演算子で3回実行
+   - `<keyword> site:reddit.com`
+   - `<keyword> site:chiebukuro.yahoo.co.jp`
+   - `<keyword> site:bbs.kakaku.com`
+3. News
+   - `GET /res/v1/news/search`
+4. Videos
+   - `GET /res/v1/videos/search`
+5. Suggestion
+   - `GET /res/v1/suggest/search`
+   - `rich=true`を試し、契約上利用できない場合は`rich=false`へフォールバックする
+
+### Webページ処理
+
+1. Brave Web結果の各URLへアクセスする。
+2. `script`、`style`、`noscript`、`template`、`iframe`を除外する。
+3. `nav`、`header`、`footer`、`aside`配下の見出しを除外する。
+4. H2/H3を抽出・正規化する。
+5. 既知のプロンプトインジェクション文字列や不可視文字を検査する。
+6. 検知ページはH2/H3を空にして頻度集計から除外する。
+7. ページ取得に失敗しても、Braveが返したタイトル・スニペットはWeb一覧に残す。
+
+### 出力
+
+- `serp_data`
+- `02-serp.json`
+- カテゴリ別APIエラーと警告
+
+### 失敗処理
+
+- Web Search API自体が失敗、またはWeb結果が0件なら工程を停止する。
+- Discussions、News、Videos、Suggestionの個別失敗は他カテゴリを破棄せず、該当タブに生エラーを表示する。
+- H2/H3取得が0件でも、SERPタイトル・スニペットがあれば次工程へ進める。
+
+---
+
+## Step 3 — Analysis
+
+### 目的
+
+Pythonによる客観的な集計とAIによる戦略的な解釈を分離し、根拠を追跡できるAnalysisを作成します。
+
+### 3-A. Python Evidence
+
+`analyze_serp()`が次を実行します。
+
+- Web：取得成功ページのH2/H3を頻度集計
+- Web：ページ別タイトル、スニペット、H2/H3を整理
+- Discussions：タイトル、スニペット、媒体名を整理
+- News：タイトル、スニペット、公開時期を整理
+- Videos：タイトル、スニペット、媒体情報を整理
+- Suggestion：検索候補を整理
+- 取得失敗・警告を制約条件として追記
+
+出力：`03-analysis-evidence.md`
+
+### 3-B. AI Analysis
+
+`analysis-prompt.md`とPython Evidenceを、選択中のAIへ渡します。
+
+必須分析：
+
+1. 評価されるコンテンツの共通点
+2. ユーザーが困っていること
+3. トレンディーな話題
+4. 人気のテーマ
+5. FAQ
+6. Competitor Gap
+7. User Intent
+8. Recommended Strategy
+10. Recommended Outline Direction
+
+出力：
+
+- `serp_analysis`
+- `04-analysis.md`
+
+### 完了条件
+
+- AI Analysisが空でないこと。
+- 該当データがないカテゴリを推測で補っていないこと。
+
+---
+
+## Step 4 — Outline
+
+### 目的
+
+AnalysisとSERP根拠をもとに、検索意図を満たす記事設計図を作成・編集します。
+
+### 入力
+
+- Target Keyword
+- Owned Site URL
+- CTA URL（任意）
+- `serp_analysis`
+- SERPタイトル・スニペット・H2/H3
+- `outline-prompt.md`
+- 本SOP
+- `data-integrity.md`
+
+### 必須ルール
+
+1. Web上位の共通テーマを網羅する。
+2. DiscussionsのPain Pointに回答できる構成にする。
+3. Newsで鮮度が重要な場合は最新情報を扱う。
+4. Videosで人気の手順・比較・実演を、記事で理解できる形へ変換する。
+5. SuggestionとDiscussionsから、本文の重複にならないFAQ H2を必ず設計する。
+6. 1つのH2では1つの読者課題だけを扱い、H2だけで論理展開が分かるようにする。
+7. 各H2へ`Recommended Format`、`Evidence Required`、`Freshness Check`、`Preferred Source Type`を指定する。
+8. 導入直後に置くKey Takeawaysを3〜5件設計する。Key TakeawaysはH2にしない。
+9. Owned Site URLを読者課題と自然につなぐH2を1つ設ける。ただし、URLだけから機能・実績・価格を推測しない。
+11. CTA URLがある場合だけ、最も自然な1つのH2へCTA配置を指定する。空欄ならCTAを設計しない。
+12. 競合見出しをコピーしない。
+13. 各H2に`[id: h2-01]`形式の安定IDを付ける。
+14. ユーザーは生成結果を編集し、`Save Outline`で確定できる。
+
+### 出力
+
+- `outline`
+- `05-outline.md`
+
+### 再実行
+
+- Generate Outlineは完了後もグレーのボタンとして再実行できる。
+- 保存済みOutlineを変更した場合、Originality以降をリセットする。
+
+---
+
+## Step 5 — Originality
+
+### 目的
+
+競合上位ページにない、または説明が薄い独自要素を3件提示し、ユーザーが1件を選択します。必要に応じて、参考URL、意見、現場知見などの追加情報も同時に確定します。
+
+### 入力
+
+- Target Keyword
+- Owned Site URL
+- SERP Analysis
+- SERP根拠
+- 確定Outline
+- `originality-prompt.md`
+- Additional Information（任意。URL、意見、現場知見、補足条件）
+
+### 必須ルール
+
+1. 具体的に本文へ追加できる要素にする。
+2. 前提知識、浅い論点、古い情報、初心者のつまずき、失敗例、比較・判断基準、手順、チェックリスト、注意点・限界、次の行動の不足をコンテンツギャップとして評価する。
+3. Owned Site URLと自然につながる案にし、メリットだけでなく適用条件、注意点、向かないケース、限界も含める。
+4. URLだけからサービス内容、価格、機能、実績を推測しない。
+5. 根拠のない調査・数値・事例を作らない。
+6. 既存Outlineと重複しない。
+7. 検索意図から外れない。
+8. JSON配列として3件出力する。
+9. 各案に`title`、`description`、`placement`を含める。
+10. `placement`はH2 IDまたはH2見出しで指定する。
+11. 3案の表示後、ユーザーが1案を選択し、任意のAdditional Informationを入力できるようにする。
+12. Additional Information内の意見は客観的事実として扱わず、URLだけからリンク先の内容を推測しない。
+
+### 出力
+
+- `originality_proposals`
+- `06-originality-proposals.json`
+- ユーザー選択後：`selected_originality`
+  - `title`
+  - `description`
+  - `placement`
+  - `additional_information`（空文字可）
+- `07-selected-originality.json`
+
+### 完了条件
+
+- ユーザーが1案を選択し、必要に応じてAdditional Informationを入力する。
+- `Confirm Originality`を押して、選択案と追加情報を一緒に確定する。
+- 選択案または追加情報を変更した場合は再確認が必要となり、未確認の間はArticle Generationを無効にする。
+- 確定後、Article Generationを有効にする。
+
+---
+
+## Step 6 — Article Generation
+
+### 目的
+
+確定OutlineをH2単位で執筆し、1本の記事へ統合します。
+
+### 入力
+
+- Target Keyword
+- Owned Site URL
+- CTA URL（任意）
+- SERP Analysis
+- 確定Outline
+- Selected Originality
+- Selected Originalityに保存されたAdditional Information（任意）
+- `article-prompt.md`
+- `writing-style.md`
+- `data-integrity.md`
+- 本SOP
 
 ### 手順
 
-1. **run_id の発行** (詳細: [run-layout.md](run-layout.md))
-   - `{YYYYMMDD-HHMM}-{slug}` 形式。`slug` は引数または "auto"。
-   - `.seo/runs/{run_id}/run.json` を初期化 (`phase: "find-keywords"`, `started_at`)。
+1. OutlineからMeta Title、Meta Description、H1、H2 ID、見出し、該当ブロック、Key Takeawaysを抽出する。
+2. Selected Originalityの`placement`から挿入先H2を決める。
+3. Additional Informationがある場合は、選択した独自要素を具体化する補足として同じ対象H2へ渡す。意見は見解として扱い、URLだけから内容を推測しない。
+4. CTA URLがある場合は`CTA Placement`、`Owned Site Role`、まとめ系見出しからCTA挿入先を1つ決める。
+5. H2ごとにAIを呼び出し、そのH2本文だけを生成する。
+6. 抽象的な説明の後に、具体的な状況、比較軸、判断基準、手順、失敗例、条件別の違いのいずれかを入れる。
+7. 仮想例は仮定であることを明示し、実在する実績・事例を捏造しない。
+8. Owned Site URLは`Owned Site Role`で指定されたセクションへ、文脈に合うMarkdownリンクを1回だけ入れる。URLだけから機能・実績・価格を推測しない。
+9. CTA URLがある場合だけ、指定セクションへ文脈に合うMarkdownリンクを1回入れる。空欄ならリンクや仮URLを作らない。同じURL・同じセクションの場合はリンクを重複させない。
+10. 独自要素は対象H2に一度だけ反映する。
+11. 各ドラフトを`08-drafts/{h2-id}.md`へ保存する。
+12. YAMLフロントマターの`title`・`description`、H1、Key Takeaways、H2、各ドラフトを順序どおり統合する。
+13. `09-article.md`へ保存する。
+14. ユーザーは記事を編集し、`Save Article`で確定できる。
 
-2. **期間決定**
-   - 既定: 直近28日 (MCP既定)
-   - ユーザー指定があれば `start_date` / `end_date` を上書き。
+### 完了条件
 
-3. **データ取得 (並列実行可)**
-   - `mcp__ictgrowthhacker-analytics__gsc_position_window` (`min_position=4, max_position=15, min_impressions=200`)
-   - `mcp__ictgrowthhacker-analytics__gsc_low_ctr_pages` (`min_impressions=500, max_ctr=0.02`)
-   - `mcp__ictgrowthhacker-analytics__ga4_landing_pages` (`limit=50`)
-   - いずれかが空配列の場合も「(該当データなし)」と明記して続行。
+- 最終記事の先頭に`title`と`description`が出力されている。
+- Outline内の全H2に対応する本文が生成されている。
+- 空のドラフトがない。
+- 選択した独自要素が重複していない。
+- Additional Informationが入力されている場合、未検証の事実として断定せず、選択した独自性の文脈で反映されている。
 
-4. **URL名寄せ**
-   - 末尾スラッシュ・クエリ文字列・`#` 以降を正規化して GSC × GA4 を突き合わせ。
-   - 突き合わせ不可なものは「GA4側データなし」「GSC側データなし」と明示。
+### 冪等性
 
-5. **タイプ分類**
-   - **タイプA: 順位浮上型** — `position` ∈ [4, 15] かつ `impressions` 多
-   - **タイプB: CTR改善型** — `impressions` 多 かつ `ctr` 低
-   - **タイプC: 離脱解消型** — GSCで表示あるがGA4で `engagementRate` 低
-
-6. **候補1〜3件を選定**
-   - 「インパクト = `impressions × (改善見込みCTR - 現CTR)`」のように、**生データの組み合わせ**でランク付け。
-   - 推測の追加データを足さない。
-
-7. **`01-candidates.md` 出力**
-
-   ```markdown
-   # 候補一覧 (run_id: {run_id} / 期間: YYYY-MM-DD〜YYYY-MM-DD)
-
-   ## 候補1: <URL>
-   - タイプ: A / B / C (複数該当可)
-   - 根拠データ:
-     - impressions: 1,234
-     - ctr: 1.2%
-     - position: 7.4
-     - GA4 engagementRate: 38%
-   - なぜ「お宝」か: <データに基づく1行>
-   - 想定ターゲットKW: <KW案>
-
-   ## 候補2: ...
-   ## 候補3: ...
-   ```
-
-8. **run.json 更新**
-   - `phase: "candidates-ready"`、`candidates: [{ index, url, type, target_kw }]`
-
-9. **ユーザーへの問いかけ**
-   - 「候補の target_kw / url を `/seo:select-target --keyword "<KW>" [--url <URL>]` に渡して選んでください。」と1行添える。
-   - **この時点で停止**。次工程に勝手に進まない。
+- 再生成時は同一run内のドラフトと記事を上書きする。
+- 保存済み記事を編集した場合、Fact Checkをリセットする。
 
 ---
 
-## Step 2 — 対象決定 (`/seo:select-target --keyword "<KW>" [--url <URL>]`)
+## Step 7 — Fact Check
 
 ### 目的
-対象キーワード(と任意で改善対象URL)を確定し、後工程の入力を固める。Step 1 (`/seo:find-keywords`) を経由しない直接指定にも対応する。
+
+生成・編集済みの記事から検証可能な主張を抽出し、外部情報源と照合します。
+
+### 入力
+
+- 確定Article
+- `factcheck-prompt.md`
+- 選択中AIのWeb検索機能
 
 ### 手順
 
-1. `--keyword` が指定されているか検証。未指定なら停止してエラー報告。
-2. `--run` 指定時は該当 `run.json` を読み込み上書き対象とする(phase不問)。省略時は新規 `run_id` を発行し `run.json` を新規作成する。
-3. `--url` が指定されている場合のみ、**クエリレベル詳細** を追加取得:
-   - `mcp__ictgrowthhacker-analytics__health_check` で `gsc_ok: true` を確認(失敗なら停止)
-   - `mcp__ictgrowthhacker-analytics__gsc_page_queries` (`page=<--url>`)
-   - `--url` 省略時はこの手順をスキップし、サブKWは「(データなし・URL未指定)」と明示する
-4. `02-selection.md` を生成:
+1. 記事内の検証可能な主張を特定する。
+2. 情報源の専門性、過去の信頼性、潜在的バイアスを評価する。
+3. 信頼できる外部情報源と照合する。
+4. 不一致、欠落文脈、古い情報を指摘する。
+5. True / Minor Errors / Needs Double-Checking / Falseで総合評価する。
+6. 追加確認方法を提示する。
 
-   ```markdown
-   # 選択キーワード (run_id: {run_id})
+### 出力
 
-   - 対象URL: <URL、未指定なら「(新規記事・URL未定)」>
-   - メインKW: <--keyword の値>
-   - サブKW候補(GSCクエリ実数のみ):
-     - <query>: impressions=X, ctr=Y%, position=Z
-     (URL未指定または取得不可の場合は「(データなし)」と明示)
-   - 検索意図仮説: <情報収集 / 比較 / 購入直前 のいずれか + 根拠1行>
-   ```
+- `fact_check`
+- `10-fact-check.md`
 
-5. `run.json` 更新: `phase: "target-selected"`, `selected: { url, target_kw, sub_kws[] }`
-6. 「次は `/seo:analyze-serp` を実行してください。」と1行添えて停止。
+### 完了条件
+
+- レポートが空でないこと。
+- 情報源不足を断定で補っていないこと。
 
 ---
 
-## Step 3 — 競合SERP取得 (`/seo:analyze-serp`)
+## 状態変更とリセット規約
 
-### 目的
-ターゲットKWのSERP上位の見出し構造を**サニタイズ済みJSON**で取得し、構成案の材料にする。
-
-### 手順
-
-1. `02-selection.md` から `target_kw` を取得。
-2. **Bash で `fetch_serp.py` を実行**:
-
-   ```bash
-   mcp_server/.venv/Scripts/python mcp_server/scripts/fetch_serp.py \
-     --keyword "<target_kw>" \
-     --top-n 8 \
-     --out .seo/runs/{run_id}/03-serp.json
-   ```
-
-   - Windows 環境では `.venv/Scripts/python.exe` を使用。
-   - 失敗時の代替手順は [serp-fallback.md](serp-fallback.md) を参照。
-
-3. **`browser_*` / `WebFetch` を Claude から直接呼ばない**。
-   - 取得したJSONがClaudeのコンテキストに入る唯一の経路は `03-serp.json` のRead。
-   - HTML本体やDOMをコンテキストに**取り込まない**。
-
-4. `03-serp.json` を Read し、以下のチェックを行う:
-   - `__BLOCKED__` 化されている見出しがある URL は分析対象から除外し、ユーザーに「URL X にインジェクション疑い」と報告。
-   - `fetch_error: true` の URL は除外。
-
-5. 共通H2/H3トピックを集計し、`03-serp-summary.md` を出力:
-
-   ```markdown
-   # SERP 要約 (run_id: {run_id} / KW: <KW>)
-
-   ## 取得成功URL (N件)
-   - <URL1>: H2={...}, H3={...}
-   - ...
-
-   ## 取得失敗 / 除外URL
-   - <URL>: 理由 (fetch_error / __BLOCKED__ / その他)
-
-   ## 共通トピック (出現頻度)
-   - <トピック>: X/Y件
-   ```
-
-6. `run.json` 更新: `phase: "serp-analyzed"`, `serp: { fetched: N, blocked: M, failed: K }`
-7. 「次は `/seo:draft-outline` を実行してください。」と1行添えて停止。
+- AI Model変更：SERP Research以降をリセットする。
+- Target KeywordまたはCountry変更：SERP Research以降をリセットし、新しいrunを開始する。
+- Owned Site URLまたはCTA URL変更：SERP ResearchとAnalysisは保持し、Outline以降をリセットする。
+- Outline変更：Originality以降をリセットする。
+- Originalityの選択またはAdditional Information変更：再確認が必要となり、確認時にArticle以降をリセットする。
+- Article変更：Fact Checkをリセットする。
+- `Reset All`：すべての画面状態を初期化する。既に保存したrun成果物は削除しない。
 
 ---
 
-## Step 4 — 構成案作成 (`/seo:draft-outline`)
+## UI規約
 
-### 目的
-SERP要約から「勝てる構成案」を作成し、執筆の設計図を固める。
-
-### 手順
-
-1. `02-selection.md` と `03-serp-summary.md` を読み込む。
-2. 競合がカバー済みの観点 / カバーされていない観点を整理。
-3. `04-outline.md` を出力:
-
-   ```markdown
-   # 構成案 (run_id: {run_id})
-
-   - H1: <タイトル案>
-   - Meta Description (120-140字): <案>
-
-   ## H2-1: <見出し> [id: h2-01]
-   - 要点(1-2行):
-   - ### H3-1-1: ...
-   - ### H3-1-2: ...
-
-   ## H2-2: <見出し> [id: h2-02]
-   ...
-   ```
-
-   各H2には**安定したID** (`h2-01`, `h2-02`, ...) を付ける。後工程の `/seo:write-section` 引数になる。
-
-4. `run.json` 更新: `phase: "outline-ready"`, `outline: { h2s: [{ id, title }, ...] }`
-5. 「次は `/seo:write-section h2-01` から順に実行してください。」と1行添えて停止。
+- 主要機能名は英語で表示する。
+- 補足説明は日本語を併記できる。
+- 全体フォントサイズは12pxとする。
+- 白背景と青アクセントを基本とする。
+- 完了済み工程の実行ボタンはグレーにするが、再実行可能な状態を維持する。
+- OutlineはSERP Analysisの下に全幅で表示する。
+- 完了済み工程は閉じ、必要に応じて再展開できる。
 
 ---
 
-## Step 5 — H2執筆 (`/seo:write-section [<h2-id>]`)
+## セキュリティ・エラー規約
 
-### 目的
-H2 セクション本文を `05-drafts/{h2-id}.md` に出力する。
-**単体モード**(1 H2 だけ書く)と**並列モード**(残り全 H2 を一括並列で書く)の 2 通りの呼び出しに対応する。
-
-### 共通の執筆ルール
-
-執筆スタイル(語尾・PREP法・文字数・表/箇条書きの使い分け・(要出典) 運用 等)はすべて [writing-style.md](writing-style.md) に集約。
-単体・並列のどちらのモードでも本ファイルを必ず参照する。並列モードでサブエージェントに渡すプロンプトには本ファイル全体を引用する。
-
-### 5-A. 単体モード: `/seo:write-section <h2-id>`
-
-引数で指定された 1 つの H2 だけを書く。差し戻し・部分書き直し用途。
-
-1. `04-outline.md` と `run.json` から `<h2-id>` のメタ情報を取得。存在しなければエラー報告して停止。
-2. `phase ∈ { "outline-ready", "drafting" }` でなければ停止。
-3. `05-drafts/{h2-id}.md` を [writing-style.md](writing-style.md) に従って出力:
-
-   ```markdown
-   ## <H2 見出し>
-
-   本文 ...
-
-   ### <H3 見出し>
-   本文 ...
-   ```
-
-4. `run.json` 更新: `drafts[{h2-id}] = "written"`、最初に書かれた時点で `phase: "drafting"` に遷移、`updated_at` 更新。
-5. 「次は `/seo:write-section <次のh2-id>` を実行してください。すべて完了したら `/seo:assemble` で統合します。残り全部を一括で書くなら `/seo:write-section`(引数なし)で並列実行できます。」と添えて停止。
-
-### 5-B. 並列モード: `/seo:write-section`(引数なし)
-
-pending な全 H2 を「H2-01 直列 → 残り並列」で一括執筆する。初回一括執筆用途。
-
-#### 1. run 特定 & phase 検証
-- `phase ∈ { "outline-ready", "drafting" }` でなければ停止。
-- `run.json.outline.h2s[]` のうち `drafts[id] == "pending"` の一覧を抽出。
-- 全 H2 が既に `written` なら「全 H2 執筆済みです。`/seo:assemble` を実行してください」と案内して停止。
-
-#### 2. H2-01 を親エージェントが直列で執筆
-pending の中に `h2-01` が含まれる場合のみ実施。含まれない場合(例: `h2-01` だけ既に書き直し済み)は手順 3 にスキップし、文体見本として既存の `05-drafts/h2-01.md` を読み込む。
-
-- 単体モードと同じ手順で `05-drafts/h2-01.md` を出力。
-- **この時点では `run.json` をまだ更新しない**(並列完了後に一括更新するため)。
-- 後続のサブエージェントにとっての**文体見本**になるので、[writing-style.md](writing-style.md) に厳格に従う。
-
-#### 3. 残りの H2 を並列起動
-pending リストから `h2-01` を除いた全 H2 を、`Agent` ツールで**1 メッセージ内に複数並べて同時呼び出し**する。並列度の上限は設けない(H2 数ぶん全並列)。ただし H2 が 10 個を超える場合は事前にユーザーへ「H2 が N 個あります。並列実行するとレート制限・コスト増の可能性があります」と1行注意喚起してから起動する。
-
-各 Agent への指示(`subagent_type: "general-purpose"`)に含めるもの:
-
-- **タスク本文**: 「あなたは 1 つの H2 セクションを執筆するサブエージェントです」
-- **担当 H2 の情報**:
-  - id, 見出し, 要点(`04-outline.md` の該当 H2 ブロックを抜粋)
-  - H3 見出しと要点(`04-outline.md` から)
-- **書かない範囲**: 他 H2 のタイトルと要点リスト(重複防止)
-- **SERP 要約**: `03-serp-summary.md` の該当部分(または全文)
-- **文体見本**: `05-drafts/h2-01.md` の本文をそのまま貼付
-- **共通スタイル**: [writing-style.md](writing-style.md) の本文をそのまま貼付
-- **データ整合性**: [data-integrity.md](data-integrity.md) の要点(MCP実数のみ、不確実な数字は `(要出典)` 明示)
-- **出力先**: `.seo/runs/{run_id}/05-drafts/{h2-id}.md` を Write すること
-- **禁止事項**(明確に列挙):
-  - `run.json` を変更しない
-  - MCP ツール(`mcp__ictgrowthhacker-analytics__*` 等)を呼ばない
-  - `fetch_serp.py` を実行しない
-  - ネットワーク取得を行わない
-  - 他の H2 を書かない、見出しに触れない
-- **完了報告**: 出力ファイルパス + 書いた文字数の自己申告
-
-#### 4. 完了集約 & 検証
-- 全 Agent の戻りを受け取る。
-- 各 `05-drafts/{h2-id}.md` のファイル存在を Read で確認。
-- 欠落・空ファイルがあれば、当該 h2-id を `failed_ids` リストに加える。
-
-#### 5. `run.json` 一括更新(親が単独で実施)
-- 成功した H2 をまとめて `drafts[id] = "written"` に更新。
-- `phase: "drafting"`、`updated_at` 更新。
-- 失敗 H2 は `drafts[id] = "pending"` のまま残す(冪等な再開を可能にするため)。
-
-#### 6. ユーザーへの案内
-- 全 H2 成功: 「すべての H2 を執筆しました。`/seo:assemble` で統合してください」
-- 部分失敗: 「次の H2 が書けませんでした: <失敗id一覧>。`/seo:write-section <id>` で個別に書き直すか、もう一度 `/seo:write-section`(引数なし)で再実行できます」
-
-### 失敗ハンドリングと冪等性
-
-- 並列モードは何度実行しても安全。`drafts[id] == "pending"` の H2 だけが対象になるため、成功分は二重実行されない。
-- 単体モードで既に `written` の H2 を再指定した場合は上書き(差し戻し対応)。
-
----
-
-## Step 6 — 最終統合 (`/seo:assemble`)
-
-### 目的
-全H2ドラフトを統合し、CMS貼付用の `06-final.md` を生成する。
-
-### 手順
-
-1. `run.json` の `outline.h2s[]` 全件について `05-drafts/{h2-id}.md` が存在することを確認。
-   - 欠けていれば「{h2-id} が未執筆です」と報告して停止。
-
-2. `06-final.md` を出力:
-
-   ```markdown
-   ---
-   title: <タイトル>
-   meta_description: <120-140字>
-   target_keyword: <メインKW>
-   secondary_keywords:
-     - <サブKW1>
-     - <サブKW2>
-   recommended_internal_link:
-     - from: <既存URL>
-       to: <新記事スラッグ案>
-       anchor_text: <推奨アンカー>
-       reason: <なぜ貼るか(データ根拠1行)>
-   ---
-
-   # <H1 タイトル>
-
-   ## <H2-1>
-   ...
-
-   ## <H2-2>
-   ...
-   ```
-
-   - `recommended_internal_link.from` は **Step 1 で取得した GA4/GSC データに登場する既存URL** に限定する。存在しないURLに貼らない。
-
-3. `run.json` 更新: `phase: "done"`, `final_path: ".seo/runs/{run_id}/06-final.md"`
-4. ユーザーに「`.seo/runs/{run_id}/06-final.md` をCMS下書きに貼り付けてください。」と案内して終了。
-
----
-
-## 各コマンド共通の終了規約
-
-- 出力末尾に**必ず**次のコマンドを1行で提示する。
-- `[待機]` のような明示マーカーは不要(Skillはコマンド粒度なので、コマンド終了=停止)。
-- 失敗・前提不足を検出したら、勝手に補正せずユーザーに不足項目を報告する。
+- APIキーをファイル、ログ、run.json、エラー補足文へ書き出さない。
+- APIから返されたエラー本文は原因確認のため画面へ表示してよい。
+- Prompt Injection疑いのH2/H3をAIコンテキストへ渡さない。
+- 失敗したカテゴリを別カテゴリの推測値で埋めない。
+- `__pycache__/`、`*.pyc`、`.env`、`.streamlit/secrets.toml`を配布ZIPに含めない。

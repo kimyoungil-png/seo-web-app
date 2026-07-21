@@ -1,9 +1,15 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .DS_Store
+Thumbs.db
 .seo/
 *.egg-info/
 dist/
 build/
-.streamlit/
+.env
+.env.*
+.streamlit/secrets.toml
