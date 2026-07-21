@@ -198,24 +198,74 @@ def _normalize_result_items(section: Any, category: str) -> list[dict[str, Any]]
             "age": age,
             "raw": raw,
         }
-        if category == "faq":
-            item["question"] = title
-            item["answer"] = description
         normalized.append(item)
     return normalized
 
 
-def _normalize_infobox(section: Any) -> dict[str, Any]:
-    if not isinstance(section, dict):
-        return {}
-    return {
-        "title": _clean_text(_first_value(section, "title", "label", "name")),
-        "description": _clean_text(
-            _first_value(section, "description", "long_desc", "summary", "subtype")
+def _normalize_entity_suggestions(section: Any) -> list[dict[str, Any]]:
+    """Autosuggest rich=true の results をEntity候補として正規化する。"""
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(_as_list(section), 1):
+        if not isinstance(raw, dict):
+            raw = {"query": raw}
+        normalized.append({
+            "rank": index,
+            "query": _clean_text(raw.get("query")),
+            "is_entity": bool(raw.get("is_entity")),
+            "title": _clean_text(_first_value(raw, "title", "query", "name")),
+            "description": _clean_text(_first_value(raw, "description", "subtitle", "summary")),
+            "image": _clean_text(_first_value(raw, "img", "image", "thumbnail")),
+            "raw": raw,
+        })
+    # Entity判定された候補を先頭にする。判定フィールドがないプランでもrich情報を保持する。
+    return sorted(normalized, key=lambda item: (not item["is_entity"], item["rank"]))
+
+
+def _brave_get(
+    endpoint: str,
+    api_key: str,
+    params: dict[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not api_key:
+        raise ValueError("Brave Search API Keyを入力してください。")
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": api_key,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/134.0.0.0 Safari/537.36"
         ),
-        "url": _clean_text(_first_value(section, "url", "source_url")),
-        "attributes": section.get("attributes") or section.get("data") or [],
-        "raw": section,
+    }
+    url = f"https://api.search.brave.com{endpoint}"
+    response = httpx.get(url, headers=headers, params=params, timeout=30.0)
+    if response.status_code != 200:
+        raise RuntimeError(f"Brave {label} API error {response.status_code}: {response.text}")
+    return response.json()
+
+
+def _base_search_params(
+    keyword: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> dict[str, Any]:
+    return {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 20),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": "true",
+        "text_decorations": "false",
+        "extra_snippets": "true",
     }
 
 
@@ -228,52 +278,83 @@ def _search_brave(
     search_lang: str,
     ui_lang: str,
 ) -> dict[str, Any]:
-    """Brave Web Search APIからWeb・Discussions・FAQ・News・Videos・Entityを一括取得する。"""
-    if not api_key:
-        raise ValueError("Brave Search API Keyを入力してください。")
+    """Braveの専用エンドポイントとsite検索から用途別SERPを取得する。"""
+    base = _base_search_params(
+        keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
+    )
 
-    url = "https://api.search.brave.com/res/v1/web/search"
-    headers = {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": api_key,
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/134.0.0.0 Safari/537.36"
-        ),
-    }
-    params = {
+    # 1) Web: GET /res/v1/web/search
+    web_raw = _brave_get(
+        "/res/v1/web/search", api_key, base, label="Web Search"
+    )
+    web_items = _normalize_result_items(web_raw.get("web"), "web")[:top_n]
+
+    # 2) Discussions: 専用endpointは使わず、Web Search + site: 演算子で3媒体を取得
+    discussion_sites = [
+        ("Reddit", "reddit.com"),
+        ("Yahoo!知恵袋", "chiebukuro.yahoo.co.jp"),
+        ("価格.com掲示板", "bbs.kakaku.com"),
+    ]
+    discussions: list[dict[str, Any]] = []
+    discussion_raw: dict[str, Any] = {}
+    per_site_count = min(max(top_n, 1), 10)
+    for source_label, site in discussion_sites:
+        params = _base_search_params(
+            f"{keyword} site:{site}",
+            per_site_count,
+            country=country,
+            search_lang=search_lang,
+            ui_lang=ui_lang,
+        )
+        data = _brave_get(
+            "/res/v1/web/search", api_key, params, label=f"Discussions ({source_label})"
+        )
+        discussion_raw[site] = data
+        items = _normalize_result_items(data.get("web"), "discussions")
+        for item in items:
+            item["source"] = source_label
+            item["site"] = site
+            item["discussion_query"] = params["q"]
+        discussions.extend(items)
+
+    # 4) News: GET /res/v1/news/search
+    news_raw = _brave_get(
+        "/res/v1/news/search", api_key, base, label="News Search"
+    )
+    news_items = _normalize_result_items(news_raw.get("results"), "news")[:top_n]
+
+    # 5) Videos: GET /res/v1/videos/search
+    videos_raw = _brave_get(
+        "/res/v1/videos/search", api_key, base, label="Videos Search"
+    )
+    video_items = _normalize_result_items(videos_raw.get("results"), "videos")[:top_n]
+
+    # 6) Entity: GET /res/v1/suggest/search?q=...&rich=true
+    suggest_params = {
         "q": keyword,
         "country": country,
-        "search_lang": search_lang,
-        "ui_lang": ui_lang,
-        "count": min(max(top_n, 1), 20),
-        "offset": 0,
-        "safesearch": "moderate",
-        "spellcheck": "true",
-        "text_decorations": "false",
-        "extra_snippets": "true",
-        "result_filter": "web,discussions,faq,news,videos,infobox",
+        "count": min(max(top_n, 1), 10),
+        "rich": "true",
     }
+    suggest_raw = _brave_get(
+        "/res/v1/suggest/search", api_key, suggest_params, label="Autosuggest"
+    )
+    entity_items = _normalize_entity_suggestions(suggest_raw.get("results"))
 
-    response = httpx.get(url, headers=headers, params=params, timeout=30.0)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Brave Search API error {response.status_code}: {response.text}"
-        )
-
-    data = response.json()
-    web_items = _normalize_result_items(data.get("web"), "web")[:top_n]
     return {
         "web": web_items,
-        "discussions": _normalize_result_items(data.get("discussions"), "discussions"),
-        "faq": _normalize_result_items(data.get("faq"), "faq"),
-        "news": _normalize_result_items(data.get("news"), "news"),
-        "videos": _normalize_result_items(data.get("videos"), "videos"),
-        "entity": _normalize_infobox(data.get("infobox")),
-        "query": data.get("query") or {},
-        "raw_response": data,
+        "discussions": discussions,
+        "news": news_items,
+        "videos": video_items,
+        "entity": entity_items,
+        "query": web_raw.get("query") or {},
+        "raw_response": {
+            "web": web_raw,
+            "discussions": discussion_raw,
+            "news": news_raw,
+            "videos": videos_raw,
+            "entity": suggest_raw,
+        },
     }
 
 def step2_fetch_serp_and_filter(
@@ -285,7 +366,7 @@ def step2_fetch_serp_and_filter(
     credentials: dict[str, str],
     top_n: int = 8,
 ) -> dict:
-    """Braveの複数SERPタイプを取得し、Web結果のみH2/H3を抽出する。"""
+    """BraveのWeb・site検索Discussions・News・Videos・Entityを取得する。"""
     if provider != "brave":
         raise ValueError(f"未対応のSERPプロバイダーです: {provider}")
 
@@ -320,7 +401,6 @@ def step2_fetch_serp_and_filter(
         "results": valid_results,
         "web": valid_results,
         "discussions": brave_data.get("discussions", []),
-        "faq": brave_data.get("faq", []),
         "news": brave_data.get("news", []),
         "videos": brave_data.get("videos", []),
         "entity": brave_data.get("entity", {}),
@@ -331,10 +411,9 @@ def step2_fetch_serp_and_filter(
             "failed_web_count": sum(bool(r.get("fetch_error")) for r in raw_results),
             "blocked_web_count": sum(bool(r.get("blocked_count", 0)) for r in raw_results),
             "discussions_count": len(brave_data.get("discussions", [])),
-            "faq_count": len(brave_data.get("faq", [])),
             "news_count": len(brave_data.get("news", [])),
             "videos_count": len(brave_data.get("videos", [])),
-            "entity_available": bool(brave_data.get("entity")),
+            "entity_count": len(brave_data.get("entity", [])),
         },
     }
     (run_dir / "03-serp.json").write_text(
@@ -377,21 +456,19 @@ def build_serp_summary(serp_data: dict) -> str:
         )
     lines.extend(["", "## Discussions：ユーザーの本音・Pain Point"])
     lines.extend(_category_lines(serp_data.get("discussions", [])))
-    lines.extend(["", "## FAQ：知りたいこと・Question一覧"])
-    lines.extend(_category_lines(serp_data.get("faq", [])))
     lines.extend(["", "## News：鮮度・更新性・最新情報・変更点"])
     lines.extend(_category_lines(serp_data.get("news", [])))
     lines.extend(["", "## Videos：体験・理解促進・手順・比較・実演"])
     lines.extend(_category_lines(serp_data.get("videos", [])))
-    entity = serp_data.get("entity") or {}
-    lines.extend(["", "## Entity：検索対象の実体情報"])
-    if entity:
-        lines.extend([
-            f"- 名称: {entity.get('title', '')}",
-            f"- 説明: {entity.get('description', '')}",
-            f"- URL: {entity.get('url', '')}",
-            f"- 属性: {json.dumps(entity.get('attributes', []), ensure_ascii=False)}",
-        ])
+    entities = serp_data.get("entity") or []
+    lines.extend(["", "## Entity：Autosuggest rich候補"])
+    if entities:
+        for item in entities[:10]:
+            lines.extend([
+                f"- 名称: {item.get('title') or item.get('query', '')}",
+                f"  - Entity判定: {item.get('is_entity', False)}",
+                f"  - 説明: {item.get('description', '')}",
+            ])
     else:
         lines.append("- 該当結果なし")
     return "\n".join(lines)
@@ -429,7 +506,6 @@ def analyze_serp(serp_data: dict) -> str:
 
     categories = [
         ("Discussions：ユーザーの本音・Pain Point", "discussions"),
-        ("FAQ：知りたいこと・Question一覧", "faq"),
         ("News：鮮度・更新性・最新情報・変更点", "news"),
         ("Videos：体験・理解促進・手順・比較・実演", "videos"),
     ]
@@ -444,13 +520,14 @@ def analyze_serp(serp_data: dict) -> str:
         else:
             lines.append("- 該当結果なし")
 
-    entity = serp_data.get("entity") or {}
-    lines.extend(["", "### Entity：検索対象の実体情報"])
-    if entity:
-        lines.append(f"- **{entity.get('title', '')}**：{entity.get('description', '')}")
-        attrs = entity.get("attributes") or []
-        if attrs:
-            lines.append(f"- 属性：{json.dumps(attrs, ensure_ascii=False)}")
+    entities = serp_data.get("entity") or []
+    lines.extend(["", f"### Entity：Autosuggest rich候補（取得 {len(entities)}件）"])
+    if entities:
+        for item in entities[:10]:
+            label = item.get("title") or item.get("query") or "(名称なし)"
+            desc = item.get("description") or ""
+            flag = "Entity" if item.get("is_entity") else "Suggestion"
+            lines.append(f"- **{label}**（{flag}）：{desc}")
     else:
         lines.append("- 該当結果なし")
 
@@ -459,7 +536,6 @@ def analyze_serp(serp_data: dict) -> str:
         "### 構成作成時の判断基準",
         "- Webの共通論点を検索意図の中核として構成に反映する",
         "- Discussionsから悩み・不満・障壁・生の表現を抽出する",
-        "- FAQを見出し候補と記事末尾の質問候補に利用する",
         "- Newsから更新日、制度変更、製品変更など鮮度が必要な論点を確認する",
         "- Videosから手順、比較、実演、視覚説明が有効な箇所を特定する",
         "- Entityで名称、属性、関連概念の一貫性を確認する",

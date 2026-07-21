@@ -124,23 +124,16 @@ def action_button(label: str, key: str, completed: bool) -> bool:
     return st.button(label, type="secondary" if completed else "primary", key=key)
 
 
-def rows_for(items: list[dict[str, Any]], *, faq: bool = False) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def rows_for(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
     for item in items:
-        if faq:
-            rows.append({
-                "Question": item.get("question") or item.get("title", ""),
-                "Answer": item.get("answer") or item.get("snippet", ""),
-                "URL": item.get("url", ""),
-            })
-        else:
-            rows.append({
-                "Title": item.get("title", ""),
-                "Snippet": item.get("snippet", ""),
-                "Source": item.get("source", ""),
-                "Date/Age": item.get("age", ""),
-                "URL": item.get("url", ""),
-            })
+        rows.append({
+            "Title": item.get("title", ""),
+            "Snippet": item.get("snippet", ""),
+            "Source": item.get("source", ""),
+            "Date/Age": item.get("age", ""),
+            "URL": item.get("url", ""),
+        })
     return rows
 
 
@@ -228,7 +221,7 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
             reset_from("serp")
             run_dir = ensure_run_dir()
             try:
-                with st.spinner("Brave Search APIからWeb、Discussions、FAQ、News、Videos、Entityを取得しています..."):
+                with st.spinner("Brave Search APIからWeb、Discussions、News、Videos、Entityを取得しています..."):
                     st.session_state.serp_data = step2_fetch_serp_and_filter(
                         keyword,
                         run_dir.name,
@@ -244,7 +237,7 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
 
         if st.session_state.serp_data:
             data = st.session_state.serp_data
-            tabs = st.tabs(["Web", "Discussions", "FAQ", "News", "Videos", "Entity", "Analysis"])
+            tabs = st.tabs(["Web", "Discussions", "News", "Videos", "Entity", "Analysis"])
             with tabs[0]:
                 st.markdown("<div class='serp-purpose'>競合分析・記事構成に利用</div>", unsafe_allow_html=True)
                 web_rows = []
@@ -269,27 +262,28 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
                 st.markdown("<div class='serp-purpose'>ユーザーの本音・Pain Pointの抽出に利用</div>", unsafe_allow_html=True)
                 st.dataframe(rows_for(data.get("discussions", [])), use_container_width=True, hide_index=True)
             with tabs[2]:
-                st.markdown("<div class='serp-purpose'>知りたいこと・Question一覧として利用</div>", unsafe_allow_html=True)
-                st.dataframe(rows_for(data.get("faq", []), faq=True), use_container_width=True, hide_index=True)
-            with tabs[3]:
-                st.markdown("<div class='serp-purpose'>鮮度・更新性・最新情報・変更点の確認に利用</div>", unsafe_allow_html=True)
+                st.markdown("<div class='serp-purpose'>鮮度・更新性・最新情報・変更点の確認に利用（News Search API）</div>", unsafe_allow_html=True)
                 st.dataframe(rows_for(data.get("news", [])), use_container_width=True, hide_index=True)
-            with tabs[4]:
-                st.markdown("<div class='serp-purpose'>体験・理解促進・手順・比較・実演の把握に利用</div>", unsafe_allow_html=True)
+            with tabs[3]:
+                st.markdown("<div class='serp-purpose'>体験・理解促進・手順・比較・実演の把握に利用（Videos Search API）</div>", unsafe_allow_html=True)
                 st.dataframe(rows_for(data.get("videos", [])), use_container_width=True, hide_index=True)
-            with tabs[5]:
-                st.markdown("<div class='serp-purpose'>Entity名、説明、属性の確認に利用（Brave APIのinfoboxをEntityとして整理）</div>", unsafe_allow_html=True)
-                entity = data.get("entity") or {}
-                if entity:
-                    st.markdown(f"### {entity.get('title') or 'Entity'}")
-                    st.write(entity.get("description", ""))
-                    if entity.get("url"):
-                        st.write(entity.get("url"))
-                    if entity.get("attributes"):
-                        st.json(entity.get("attributes"))
+            with tabs[4]:
+                st.markdown("<div class='serp-purpose'>Autosuggest APIのrich=trueでEntity候補・関連候補を取得</div>", unsafe_allow_html=True)
+                entities = data.get("entity") or []
+                if entities:
+                    entity_rows = []
+                    for item in entities:
+                        entity_rows.append({
+                            "Type": "Entity" if item.get("is_entity") else "Suggestion",
+                            "Title": item.get("title", ""),
+                            "Query": item.get("query", ""),
+                            "Description": item.get("description", ""),
+                            "Image": item.get("image", ""),
+                        })
+                    st.dataframe(entity_rows, use_container_width=True, hide_index=True)
                 else:
-                    st.info("Entity result was not returned for this query.")
-            with tabs[6]:
+                    st.info("Entity / rich suggestion result was not returned for this query.")
+            with tabs[5]:
                 st.markdown(st.session_state.serp_analysis or "")
 
 with st.expander("3. Outline — 構成案の生成・編集", expanded=states[1] and not states[2]):

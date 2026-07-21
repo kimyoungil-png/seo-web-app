@@ -28,10 +28,8 @@ A single Brave Web Search request asks for all available result types:
 
 - `web`: competitor analysis and outline planning
 - `discussions`: user voice and pain points
-- `faq`: question list and information needs
 - `news`: freshness, changes, and recent developments
 - `videos`: procedures, comparisons, demonstrations, and visual explanations
-- `infobox`: normalized in the app as `entity`
 
 Brave may omit a result type when it has no relevant data or when the subscribed plan does not include that response option.
 
@@ -58,3 +56,15 @@ Changing the AI model clears downstream AI-generated outputs so providers are no
 ## State management
 
 The application does not use `@st.cache_data`, `@st.cache_resource`, `st.cache_data`, or `st.cache_resource`. Workflow results are stored in `st.session_state` only.
+
+## Brave endpoints
+
+One SERP Research run uses the following requests:
+
+- Web: `GET /res/v1/web/search`
+- Discussions: three Web Search requests using `site:reddit.com`, `site:chiebukuro.yahoo.co.jp`, and `site:bbs.kakaku.com`
+- News: `GET /res/v1/news/search`
+- Videos: `GET /res/v1/videos/search`
+- Entity candidates: `GET /res/v1/suggest/search?rich=true`
+
+FAQ retrieval has been removed. A full run therefore makes seven Brave API requests before fetching headings from individual Web result pages.
