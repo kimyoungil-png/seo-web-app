@@ -202,8 +202,8 @@ def _normalize_result_items(section: Any, category: str) -> list[dict[str, Any]]
     return normalized
 
 
-def _normalize_entity_suggestions(section: Any) -> list[dict[str, Any]]:
-    """Autosuggest rich=true の results をEntity候補として正規化する。"""
+def _normalize_suggestions(section: Any) -> list[dict[str, Any]]:
+    """Autosuggest API の results をSuggestionとして正規化する。"""
     normalized: list[dict[str, Any]] = []
     for index, raw in enumerate(_as_list(section), 1):
         if not isinstance(raw, dict):
@@ -211,14 +211,12 @@ def _normalize_entity_suggestions(section: Any) -> list[dict[str, Any]]:
         normalized.append({
             "rank": index,
             "query": _clean_text(raw.get("query")),
-            "is_entity": bool(raw.get("is_entity")),
             "title": _clean_text(_first_value(raw, "title", "query", "name")),
             "description": _clean_text(_first_value(raw, "description", "subtitle", "summary")),
             "image": _clean_text(_first_value(raw, "img", "image", "thumbnail")),
             "raw": raw,
         })
-    # Entity判定された候補を先頭にする。判定フィールドがないプランでもrich情報を保持する。
-    return sorted(normalized, key=lambda item: (not item["is_entity"], item["rank"]))
+    return normalized
 
 
 def _brave_get(
@@ -390,7 +388,7 @@ def _search_brave(
         errors["videos"] = str(exc)
         raw_response["videos"] = {}
 
-    entity_items: list[dict[str, Any]] = []
+    suggestion_items: list[dict[str, Any]] = []
     try:
         suggest_params = {
             "q": keyword,
@@ -401,18 +399,18 @@ def _search_brave(
         suggest_raw = _brave_get(
             "/res/v1/suggest/search", api_key, suggest_params, label="Autosuggest"
         )
-        raw_response["entity"] = suggest_raw
-        entity_items = _normalize_entity_suggestions(suggest_raw.get("results"))
+        raw_response["suggestion"] = suggest_raw
+        suggestion_items = _normalize_suggestions(suggest_raw.get("results"))
     except Exception as exc:
-        errors["entity"] = str(exc)
-        raw_response["entity"] = {}
+        errors["suggestion"] = str(exc)
+        raw_response["suggestion"] = {}
 
     return {
         "web": web_items,
         "discussions": discussions,
         "news": news_items,
         "videos": video_items,
-        "entity": entity_items,
+        "suggestion": suggestion_items,
         "query": web_raw.get("query") or {},
         "errors": errors,
         "raw_response": raw_response,
@@ -427,7 +425,7 @@ def step2_fetch_serp_and_filter(
     credentials: dict[str, str],
     top_n: int = 8,
 ) -> dict:
-    """BraveのWeb・site検索Discussions・News・Videos・Entityを取得する。"""
+    """BraveのWeb・site検索Discussions・News・Videos・Suggestionを取得する。"""
     if provider != "brave":
         raise ValueError(f"未対応のSERPプロバイダーです: {provider}")
 
@@ -464,7 +462,7 @@ def step2_fetch_serp_and_filter(
         "discussions": brave_data.get("discussions", []),
         "news": brave_data.get("news", []),
         "videos": brave_data.get("videos", []),
-        "entity": brave_data.get("entity", {}),
+        "suggestion": brave_data.get("suggestion", {}),
         "query": brave_data.get("query", {}),
         "diagnostics": {
             "raw_web_count": len(raw_results),
@@ -474,7 +472,7 @@ def step2_fetch_serp_and_filter(
             "discussions_count": len(brave_data.get("discussions", [])),
             "news_count": len(brave_data.get("news", [])),
             "videos_count": len(brave_data.get("videos", [])),
-            "entity_count": len(brave_data.get("entity", [])),
+            "suggestion_count": len(brave_data.get("suggestion", [])),
         },
     }
     (run_dir / "03-serp.json").write_text(
@@ -521,21 +519,24 @@ def build_serp_summary(serp_data: dict) -> str:
     lines.extend(_category_lines(serp_data.get("news", [])))
     lines.extend(["", "## Videos：体験・理解促進・手順・比較・実演"])
     lines.extend(_category_lines(serp_data.get("videos", [])))
-    entities = serp_data.get("entity") or []
-    lines.extend(["", "## Entity：Autosuggest rich候補"])
-    if entities:
-        for item in entities[:10]:
+    suggestions = serp_data.get("suggestion") or []
+    lines.extend(["", "## Suggestion：検索候補"])
+    if suggestions:
+        for item in suggestions[:10]:
             lines.extend([
                 f"- 名称: {item.get('title') or item.get('query', '')}",
-                f"  - Entity判定: {item.get('is_entity', False)}",
-                f"  - 説明: {item.get('description', '')}",
+                                f"  - 説明: {item.get('description', '')}",
             ])
     else:
         lines.append("- 該当結果なし")
     return "\n".join(lines)
 
 def analyze_serp(serp_data: dict) -> str:
-    """Braveの各SERPタイプをSEO記事制作の役割別に整理する。"""
+    """AI分析前の根拠データをPythonで集計・Markdown化する。
+
+    H2/H3の取得自体はstep2内のページ取得処理で行い、この関数では頻度集計と
+    Discussions / News / Videos / Suggestionの入力整理を担当する。
+    """
     results = serp_data.get("web", serp_data.get("results", []))
     h2_counter: Counter[str] = Counter()
     h3_counter: Counter[str] = Counter()
@@ -551,57 +552,84 @@ def analyze_serp(serp_data: dict) -> str:
                 h3_counter[normalized] += 1
 
     lines = [
-        f"### Web：競合分析・構成（取得 {len(results)}件）",
+        "# SERP Analysis Evidence",
         "",
-        "#### 頻出H2",
+        f"## Web evidence（取得 {len(results)}件）",
+        "",
+        "### 頻出H2",
     ]
     lines.extend(
-        [f"- {title}（{count}ページ）" for title, count in h2_counter.most_common(12)]
+        [f"- {title}（{count}ページ）" for title, count in h2_counter.most_common(20)]
         or ["- 抽出できませんでした"]
     )
-    lines.extend(["", "#### 頻出H3"])
+    lines.extend(["", "### 頻出H3"])
     lines.extend(
-        [f"- {title}（{count}ページ）" for title, count in h3_counter.most_common(15)]
+        [f"- {title}（{count}ページ）" for title, count in h3_counter.most_common(25)]
         or ["- 抽出できませんでした"]
     )
 
     categories = [
-        ("Discussions：ユーザーの本音・Pain Point", "discussions"),
-        ("News：鮮度・更新性・最新情報・変更点", "news"),
-        ("Videos：体験・理解促進・手順・比較・実演", "videos"),
+        ("Discussions evidence", "discussions"),
+        ("News evidence", "news"),
+        ("Videos evidence", "videos"),
     ]
     for heading, key in categories:
         items = serp_data.get(key, [])
-        lines.extend(["", f"### {heading}（取得 {len(items)}件）"])
+        lines.extend(["", f"## {heading}（取得 {len(items)}件）"])
         if items:
-            for item in items[:10]:
+            for item in items[:15]:
                 title = item.get("title") or item.get("question") or "(タイトルなし)"
                 snippet = item.get("snippet") or item.get("answer") or ""
-                lines.append(f"- **{title}**：{snippet}")
+                source = item.get("source") or ""
+                lines.append(f"- タイトル: {title}")
+                lines.append(f"  - スニペット: {snippet}")
+                if source:
+                    lines.append(f"  - 出典: {source}")
         else:
             lines.append("- 該当結果なし")
 
-    entities = serp_data.get("entity") or []
-    lines.extend(["", f"### Entity：Autosuggest rich候補（取得 {len(entities)}件）"])
-    if entities:
-        for item in entities[:10]:
-            label = item.get("title") or item.get("query") or "(名称なし)"
-            desc = item.get("description") or ""
-            flag = "Entity" if item.get("is_entity") else "Suggestion"
-            lines.append(f"- **{label}**（{flag}）：{desc}")
+    suggestions = serp_data.get("suggestion") or []
+    lines.extend(["", f"## Suggestion evidence（取得 {len(suggestions)}件）"])
+    if suggestions:
+        for item in suggestions[:20]:
+            query = item.get("query") or item.get("title") or "(候補なし)"
+            description = item.get("description") or ""
+            lines.append(f"- 検索候補: {query}")
+            if description:
+                lines.append(f"  - 説明: {description}")
     else:
         lines.append("- 該当結果なし")
 
-    lines.extend([
-        "",
-        "### 構成作成時の判断基準",
-        "- Webの共通論点を検索意図の中核として構成に反映する",
-        "- Discussionsから悩み・不満・障壁・生の表現を抽出する",
-        "- Newsから更新日、制度変更、製品変更など鮮度が必要な論点を確認する",
-        "- Videosから手順、比較、実演、視覚説明が有効な箇所を特定する",
-        "- Entityで名称、属性、関連概念の一貫性を確認する",
-    ])
     return "\n".join(lines)
+
+
+def step2_generate_analysis(
+    llm: LLMService,
+    keyword: str,
+    serp_data: dict,
+    run_dir: Path,
+) -> str:
+    """Pythonで整理したSERP根拠をanalysis-prompt.mdに従ってAI分析する。"""
+    analysis_prompt = load_prompt_file("analysis-prompt.md")
+    if not analysis_prompt.strip():
+        raise FileNotFoundError(
+            "analysis-prompt.mdが見つかりません。referencesに配置してください。"
+        )
+
+    evidence = analyze_serp(serp_data)
+    (run_dir / "04-analysis-evidence.md").write_text(evidence, encoding="utf-8")
+
+    user_prompt = f"""
+対策キーワード: {keyword}
+
+以下はPythonで取得・集計したSERP根拠データです。
+記載されていない内容を推測で補わず、analysis-prompt.mdの形式で分析してください。
+
+{evidence}
+"""
+    analysis = llm.generate(analysis_prompt, user_prompt)
+    (run_dir / "05-serp-analysis.md").write_text(analysis, encoding="utf-8")
+    return analysis
 
 def step3_generate_outline(
     llm: LLMService,

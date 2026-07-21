@@ -6,7 +6,7 @@ import streamlit as st
 
 from backend import (
     MODEL_OPTIONS,
-    analyze_serp,
+    step2_generate_analysis,
     create_llm_service,
     get_model_config,
     step2_fetch_serp_and_filter,
@@ -221,7 +221,7 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
             reset_from("serp")
             run_dir = ensure_run_dir()
             try:
-                with st.spinner("Brave Search APIからWeb、Discussions、News、Videos、Entityを取得しています..."):
+                with st.spinner("SERP取得後、PythonでH2/H3等を整理し、AIで横断分析しています..."):
                     st.session_state.serp_data = step2_fetch_serp_and_filter(
                         keyword,
                         run_dir.name,
@@ -230,14 +230,20 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
                         credentials=serp_credentials,
                         top_n=result_count,
                     )
-                    st.session_state.serp_analysis = analyze_serp(st.session_state.serp_data)
+                    llm = create_llm_service(api_key, llm_choice)
+                    st.session_state.serp_analysis = step2_generate_analysis(
+                        llm,
+                        keyword,
+                        st.session_state.serp_data,
+                        run_dir,
+                    )
                 st.rerun()
             except Exception as exc:
                 st.error(f"SERP Research error: {exc}")
 
         if st.session_state.serp_data:
             data = st.session_state.serp_data
-            tabs = st.tabs(["Web", "Discussions", "News", "Videos", "Entity", "Analysis"])
+            tabs = st.tabs(["Web", "Discussions", "News", "Videos", "Suggestion", "Analysis"])
             with tabs[0]:
                 st.markdown("<div class='serp-purpose'>競合分析・記事構成に利用</div>", unsafe_allow_html=True)
                 web_rows = []
@@ -288,23 +294,22 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
                 if errors.get("videos"):
                     st.error(errors["videos"])
             with tabs[4]:
-                st.markdown("<div class='serp-purpose'>Autosuggest APIのrich=trueでEntity候補・関連候補を取得</div>", unsafe_allow_html=True)
-                entities = data.get("entity") or []
-                if entities:
-                    entity_rows = []
-                    for item in entities:
-                        entity_rows.append({
-                            "Type": "Entity" if item.get("is_entity") else "Suggestion",
-                            "Title": item.get("title", ""),
+                st.markdown("<div class='serp-purpose'>Autosuggest APIで検索候補・関連候補を取得</div>", unsafe_allow_html=True)
+                suggestions = data.get("suggestion") or []
+                if suggestions:
+                    suggestion_rows = []
+                    for item in suggestions:
+                        suggestion_rows.append({
+                                                        "Title": item.get("title", ""),
                             "Query": item.get("query", ""),
                             "Description": item.get("description", ""),
                             "Image": item.get("image", ""),
                         })
-                    st.dataframe(entity_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(suggestion_rows, use_container_width=True, hide_index=True)
                 else:
-                    st.info("Entity / rich suggestion result was not returned for this query.")
-                if errors.get("entity"):
-                    st.error(errors["entity"])
+                    st.info("Suggestion result was not returned for this query.")
+                if errors.get("suggestion"):
+                    st.error(errors["suggestion"])
             with tabs[5]:
                 st.markdown(st.session_state.serp_analysis or "")
 

@@ -65,6 +65,23 @@ One SERP Research run uses the following requests:
 - Discussions: three Web Search requests using `site:reddit.com`, `site:chiebukuro.yahoo.co.jp`, and `site:bbs.kakaku.com`
 - News: `GET /res/v1/news/search`
 - Videos: `GET /res/v1/videos/search`
-- Entity candidates: `GET /res/v1/suggest/search?rich=true`
+- Suggestion candidates: `GET /res/v1/suggest/search?rich=true`
 
 FAQ retrieval has been removed. A full run therefore makes seven Brave API requests before fetching headings from individual Web result pages.
+
+## Analysis処理
+
+SERP Researchでは、次の2段階でAnalysisを作成します。
+
+1. Pythonの`analyze_serp()`が、取得済みのH2/H3を頻度集計し、Discussions、News、Videos、SuggestionをAI入力用Markdownに整理します。
+2. 選択中のGeminiまたはOpenAIが、`references/analysis-prompt.md`に従って以下を分析します。
+   - ① 評価されるコンテンツの共通点
+   - ② ユーザーが困っていること
+   - ③ トレンディーな話題
+   - ④ 人気のテーマ
+   - ⑤ FAQ
+
+実行結果は`.seo/runs/<run_id>/`内の以下に保存されます。
+
+- `04-analysis-evidence.md`: Pythonで整理した根拠データ
+- `05-serp-analysis.md`: AIによる最終Analysis
