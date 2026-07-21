@@ -4,7 +4,7 @@ showErrorDetails = "full"
 
 [theme]
 base = "light"
-primaryColor = "#1267D6"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F7FAFF"
-textColor = "#172033"
+primaryColor = "#2458FF"
+backgroundColor = "#FBFBF8"
+secondaryBackgroundColor = "#F2F3F6"
+textColor = "#0B0B0C"

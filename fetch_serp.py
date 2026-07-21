@@ -74,6 +74,38 @@ _INVISIBLE_CHARS_RE = re.compile(
 _HEADING_MAX_LEN = 200
 
 
+class PageFetchError(RuntimeError):
+    """対象ページがHTTPエラーを返したことを呼び出し側へ伝える。"""
+
+    def __init__(self, status_code: int, url: str, detail: str = "") -> None:
+        self.status_code = int(status_code)
+        self.url = url
+        self.detail = detail
+        message = "http_{0}".format(self.status_code)
+        if detail:
+            message += ":{0}".format(detail)
+        super().__init__(message)
+
+
+def _build_page_headers(user_agent: str, accept_language: str) -> Dict[str, str]:
+    """通常のデスクトップHTMLを要求するための最小限のブラウザ互換ヘッダー。"""
+    return {
+        "User-Agent": user_agent,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": accept_language,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+
+
 # --- データ構造 -----------------------------------------------------------------
 
 @dataclass
@@ -389,23 +421,34 @@ def fetch_page_headings(
     url: str,
     user_agent: str,
     timeout: float,
+    accept_language: str = "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
 ) -> Tuple[Optional[str], List[str], List[str], List[str]]:
-    """1 ページを取得し (title, h2[], h3[], notes[]) を返す。
-    通信/パース失敗時は例外を投げる(呼び出し側で notes に詰める)。
+    """1ページを取得し(title, h2[], h3[], notes[])を返す。
+
+    CAPTCHAやアクセス制御の回避は行わない。配信元が401/403/429等を返した場合は
+    PageFetchErrorとして呼び出し側へ返し、Braveのタイトル・スニペットを代替利用する。
     """
     notes: List[str] = []
+    timeout_config = httpx.Timeout(timeout, connect=min(timeout, 10.0))
     try:
         with httpx.Client(
-            timeout=timeout,
+            timeout=timeout_config,
             follow_redirects=True,
-            headers={
-                "User-Agent": user_agent,
-                "Accept-Language": "ja,en;q=0.7",
-            },
+            max_redirects=10,
+            headers=_build_page_headers(user_agent, accept_language),
         ) as client:
             resp = client.get(url)
             if resp.status_code >= 400:
-                raise RuntimeError(f"http_{resp.status_code}")
+                server = resp.headers.get("server", "").strip()
+                detail = "server={0}".format(server) if server else ""
+                raise PageFetchError(resp.status_code, str(resp.url), detail)
+            content_type = resp.headers.get("content-type", "").lower()
+            if content_type and (
+                "text/html" not in content_type
+                and "application/xhtml+xml" not in content_type
+            ):
+                notes.append("unsupported_content_type:{0}".format(content_type.split(";")[0]))
+                return None, [], [], notes
             html = resp.text
     except httpx.TimeoutException:
         notes.append("timeout")

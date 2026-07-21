@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shutil
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 from google import genai
@@ -226,6 +230,51 @@ def save_article(run_dir: Path, article: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Page heading extraction policy
+# ---------------------------------------------------------------------------
+
+_PAGE_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+_PAGE_ACCEPT_LANGUAGE: Dict[str, str] = {
+    "JP": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "KR": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "US": "en-US,en;q=0.9",
+}
+
+# These platforms rarely expose useful article H2/H3 in server-rendered HTML.
+# Keep their Brave title/snippet as evidence instead of making a needless page request.
+_SNIPPET_ONLY_HOST_SUFFIXES: Tuple[str, ...] = (
+    "instagram.com",
+    "x.com",
+    "twitter.com",
+    "youtube.com",
+    "youtu.be",
+    "facebook.com",
+    "tiktok.com",
+)
+
+
+def _hostname(url: str) -> str:
+    return (urlparse(url).hostname or "").lower().lstrip("www.")
+
+
+def _is_snippet_only_platform(url: str) -> bool:
+    host = _hostname(url)
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _SNIPPET_ONLY_HOST_SUFFIXES)
+
+
+def _accept_language_for_country(country: str) -> str:
+    return _PAGE_ACCEPT_LANGUAGE.get(
+        str(country).upper(),
+        "en-US,en;q=0.9",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Brave Search API
 # ---------------------------------------------------------------------------
 
@@ -294,6 +343,11 @@ def _normalize_result_items(section: Any, category: str) -> List[Dict[str, Any]]
         if isinstance(thumbnail, dict):
             thumbnail = _first_value(thumbnail, "src", "url", "original")
 
+        extra_snippets = [
+            _clean_text(value)
+            for value in _as_list(raw.get("extra_snippets"))
+            if _clean_text(value)
+        ]
         normalized.append(
             {
                 "rank": index,
@@ -301,6 +355,7 @@ def _normalize_result_items(section: Any, category: str) -> List[Dict[str, Any]]
                 "title": title,
                 "url": url,
                 "snippet": description,
+                "extra_snippets": extra_snippets,
                 "source": _source_name(raw),
                 "age": age,
                 "thumbnail": _clean_text(thumbnail),
@@ -446,12 +501,16 @@ def _search_brave(
     errors: Dict[str, str] = {}
     warnings: Dict[str, str] = {}
 
+    # Request extra Web candidates in the same Brave API call. Top results are
+    # still displayed unchanged, while lower-ranked editorial pages can supplement
+    # H2/H3 analysis when official, social or protected pages cannot be fetched.
+    web_candidate_count = min(max(top_n * 2, top_n + 4), 20)
     web_raw = _brave_get(
         "/res/v1/web/search",
         api_key,
         _web_search_params(
             keyword,
-            top_n,
+            web_candidate_count,
             country=country,
             search_lang=search_lang,
             ui_lang=ui_lang,
@@ -459,7 +518,8 @@ def _search_brave(
         label="Web Search",
         location_headers=location_headers,
     )
-    web_items = _normalize_result_items(web_raw.get("web"), "web")[:top_n]
+    web_candidates = _normalize_result_items(web_raw.get("web"), "web")[:web_candidate_count]
+    web_items = web_candidates[:top_n]
 
     discussion_sites: Sequence[Tuple[str, str]] = (
         ("Reddit", "reddit.com"),
@@ -531,50 +591,83 @@ def _search_brave(
     except Exception as exc:
         errors["videos"] = str(exc)
 
+    # Autosuggest is a separate Brave endpoint. Use only the parameters documented
+    # for this endpoint: q, country and count. In particular, do not pass the Web
+    # Search `search_lang` value as `lang`, and do not require rich suggestions.
     suggestion_items: List[Dict[str, Any]] = []
-    suggest_params: Dict[str, Any] = {
-        "q": keyword,
+    suggestion_meta: Dict[str, Any] = {
+        "requested_query": keyword.strip(),
+        "requested_country": country,
+        "attempts": [],
+    }
+    base_suggest_params: Dict[str, Any] = {
+        "q": keyword.strip(),
         "country": country,
-        "lang": search_lang,
         "count": min(max(top_n, 1), 20),
-        "rich": True,
     }
     try:
         suggest_raw = _brave_get(
             "/res/v1/suggest/search",
             api_key,
-            suggest_params,
-            label="Suggest",
-            location_headers=location_headers,
+            base_suggest_params,
+            label="Autosuggest",
         )
         suggestion_items = _normalize_suggestions(suggest_raw.get("results"))
-    except Exception as rich_exc:
-        # rich=true requires a compatible Autosuggest plan. Fall back so plain suggestions can still display.
-        try:
-            fallback_params = dict(suggest_params)
-            fallback_params["rich"] = False
-            suggest_raw = _brave_get(
+        suggestion_meta["attempts"].append(
+            {
+                "mode": "country",
+                "result_count": len(suggestion_items),
+                "response_type": suggest_raw.get("type", ""),
+                "response_query": suggest_raw.get("query") or {},
+            }
+        )
+
+        # Some country-localized queries may legitimately return no suggestions.
+        # Retry once without country rather than silently showing a permanent zero.
+        if not suggestion_items:
+            global_params = {
+                "q": keyword.strip(),
+                "count": min(max(top_n, 1), 20),
+            }
+            global_raw = _brave_get(
                 "/res/v1/suggest/search",
                 api_key,
-                fallback_params,
-                label="Suggest fallback",
-                location_headers=location_headers,
+                global_params,
+                label="Autosuggest global fallback",
             )
-            suggestion_items = _normalize_suggestions(suggest_raw.get("results"))
-            warnings["suggestion"] = (
-                "rich=true request failed and plain Suggestion was used instead: {0}".format(
-                    rich_exc
+            suggestion_items = _normalize_suggestions(global_raw.get("results"))
+            suggestion_meta["attempts"].append(
+                {
+                    "mode": "global",
+                    "result_count": len(suggestion_items),
+                    "response_type": global_raw.get("type", ""),
+                    "response_query": global_raw.get("query") or {},
+                }
+            )
+            if suggestion_items:
+                warnings["suggestion"] = (
+                    "Country-specific Autosuggest returned 0 results, so a global "
+                    "Autosuggest request was used."
                 )
-            )
-        except Exception as fallback_exc:
-            errors["suggestion"] = "{0} | fallback: {1}".format(rich_exc, fallback_exc)
+            else:
+                warnings["suggestion"] = (
+                    "Brave Autosuggest returned 0 results for both country-specific "
+                    "and global requests."
+                )
+    except Exception as exc:
+        errors["suggestion"] = str(exc)
+        suggestion_meta["attempts"].append(
+            {"mode": "error", "result_count": 0, "error": str(exc)}
+        )
 
     return {
         "web": web_items,
+        "web_candidates": web_candidates,
         "discussions": discussions,
         "news": news_items,
         "videos": video_items,
         "suggestion": suggestion_items,
+        "suggestion_meta": suggestion_meta,
         "query": web_raw.get("query") or {},
         "errors": errors,
         "warnings": warnings,
@@ -582,9 +675,16 @@ def _search_brave(
 
 
 def _extract_page_details(
-    rank: int, item: Dict[str, Any], timeout: float = 15.0
+    rank: int,
+    item: Dict[str, Any],
+    timeout: float = 10.0,
+    accept_language: str = "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
 ) -> Dict[str, Any]:
-    """Web結果URLからH2/H3を取得し、既存のインジェクション検査を適用する。"""
+    """Web結果URLからH2/H3を取得し、インジェクション検査を適用する。
+
+    配信元がアクセスを拒否した場合は無理に回避せず、Braveのタイトル・
+    スニペットをAnalysis用の代替根拠として保持する。
+    """
     url = item.get("url", "")
     result: Dict[str, Any] = {
         **item,
@@ -592,20 +692,32 @@ def _extract_page_details(
         "url": url,
         "headings": {"h2": [], "h3": []},
         "fetch_error": False,
+        "http_status": None,
+        "access_status": "pending",
         "blocked_count": 0,
         "notes": [],
         "eligible_for_analysis": False,
+        "snippet_evidence_available": bool(
+            item.get("title") or item.get("snippet") or item.get("extra_snippets")
+        ),
     }
     if not url:
         result["fetch_error"] = True
+        result["access_status"] = "missing_url"
         result["notes"].append("missing_url")
+        return result
+
+    if _is_snippet_only_platform(url):
+        result["access_status"] = "snippet_only_platform"
+        result["notes"].append("snippet_only_platform")
         return result
 
     try:
         title, h2, h3, notes = fetch_serp.fetch_page_headings(
             url=url,
-            user_agent="ictGrowthHacker-SerpFetcher/1.0",
+            user_agent=_PAGE_FETCH_USER_AGENT,
             timeout=timeout,
+            accept_language=accept_language,
         )
         result["title"] = title or result.get("title")
         result["headings"] = {"h2": h2, "h3": h3}
@@ -614,15 +726,87 @@ def _extract_page_details(
         if payload_hits:
             result["blocked_count"] = payload_hits
             result["headings"] = {"h2": [], "h3": []}
+            result["access_status"] = "security_blocked"
             result["notes"].append("injection_suspected")
-        else:
+        elif h2 or h3:
+            result["access_status"] = "headings_ready"
             result["eligible_for_analysis"] = True
+        else:
+            result["access_status"] = "no_article_headings"
+            result["notes"].append("no_article_headings")
+    except fetch_serp.PageFetchError as exc:
+        result["fetch_error"] = True
+        result["http_status"] = exc.status_code
+        if exc.status_code in (401, 403, 429):
+            result["access_status"] = "publisher_blocked"
+            result["notes"].append(
+                "publisher_blocked_http_{0}".format(exc.status_code)
+            )
+        else:
+            result["access_status"] = "http_error"
+            result["notes"].append("http_{0}".format(exc.status_code))
+        if exc.detail:
+            result["notes"].append(exc.detail)
+    except httpx.TimeoutException:
+        result["fetch_error"] = True
+        result["access_status"] = "timeout"
+        result["notes"].append("timeout")
     except Exception as exc:
         result["fetch_error"] = True
+        result["access_status"] = "fetch_error"
         result["notes"].append(
             "fetch_error:{0}:{1}".format(type(exc).__name__, str(exc))
         )
     return result
+
+
+def _extract_many_page_details(
+    ranked_items: Sequence[Tuple[int, Dict[str, Any]]],
+    *,
+    accept_language: str,
+    timeout: float = 10.0,
+    max_workers: int = 4,
+) -> List[Dict[str, Any]]:
+    """複数ページを限定並列で取得し、元の順位順で返す。"""
+    if not ranked_items:
+        return []
+    results: List[Dict[str, Any]] = []
+    worker_count = min(max(max_workers, 1), len(ranked_items))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(
+                _extract_page_details,
+                rank,
+                item,
+                timeout,
+                accept_language,
+            ): rank
+            for rank, item in ranked_items
+        }
+        for future in as_completed(future_map):
+            rank = future_map[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append(
+                    {
+                        "rank": rank,
+                        "title": "",
+                        "url": "",
+                        "snippet": "",
+                        "headings": {"h2": [], "h3": []},
+                        "fetch_error": True,
+                        "http_status": None,
+                        "access_status": "worker_error",
+                        "blocked_count": 0,
+                        "notes": [
+                            "worker_error:{0}:{1}".format(type(exc).__name__, str(exc))
+                        ],
+                        "eligible_for_analysis": False,
+                        "snippet_evidence_available": False,
+                    }
+                )
+    return sorted(results, key=lambda value: int(value.get("rank") or 0))
 
 
 def step2_fetch_serp_and_filter(
@@ -656,19 +840,48 @@ def step2_fetch_serp_and_filter(
         ui_lang=str(search_settings["ui_lang"]),
         location_headers=location_headers,
     )
-    candidates = brave_data.get("web", [])
-    if not candidates:
+    all_candidates = brave_data.get("web_candidates") or brave_data.get("web", [])
+    if not all_candidates:
         raise RuntimeError("Brave Search APIからWeb検索結果を取得できませんでした。")
 
-    web_results = [
-        _extract_page_details(rank, item)
-        for rank, item in enumerate(candidates, start=1)
+    accept_language = _accept_language_for_country(str(search_settings["country"]))
+    display_candidates = list(all_candidates[:top_n])
+    display_ranked = [
+        (int(item.get("rank") or index), item)
+        for index, item in enumerate(display_candidates, start=1)
     ]
+    web_results = _extract_many_page_details(
+        display_ranked,
+        accept_language=accept_language,
+    )
     analysis_web = [
         result
         for result in web_results
         if result.get("eligible_for_analysis") and not result.get("blocked_count")
     ]
+
+    # When top results are protected, social or non-article pages, use lower-ranked
+    # editorial pages only as supplemental H2/H3 evidence. The visible top ranking
+    # remains unchanged.
+    analysis_target = min(max(top_n, 1), 6)
+    supplemental_results: List[Dict[str, Any]] = []
+    if len(analysis_web) < analysis_target:
+        extra_candidates = list(all_candidates[top_n:])
+        extra_ranked = [
+            (int(item.get("rank") or (top_n + index)), item)
+            for index, item in enumerate(extra_candidates, start=1)
+        ]
+        extracted_extras = _extract_many_page_details(
+            extra_ranked,
+            accept_language=accept_language,
+            timeout=8.0,
+        )
+        for result in extracted_extras:
+            if result.get("eligible_for_analysis") and not result.get("blocked_count"):
+                supplemental_results.append(result)
+                analysis_web.append(result)
+                if len(analysis_web) >= analysis_target:
+                    break
 
     serp_data: Dict[str, Any] = {
         "run_id": run_id,
@@ -676,18 +889,28 @@ def step2_fetch_serp_and_filter(
         "provider": provider,
         "search_settings": search_settings,
         "web": web_results,
+        "web_analysis_supplement": supplemental_results,
         "results": analysis_web,
         "discussions": brave_data.get("discussions", []),
         "news": brave_data.get("news", []),
         "videos": brave_data.get("videos", []),
         "suggestion": brave_data.get("suggestion", []),
+        "suggestion_meta": brave_data.get("suggestion_meta", {}),
         "query": brave_data.get("query", {}),
         "errors": brave_data.get("errors", {}),
         "warnings": brave_data.get("warnings", {}),
         "diagnostics": {
             "web_count": len(web_results),
             "web_heading_count": len(analysis_web),
+            "web_top_heading_count": sum(bool(r.get("eligible_for_analysis")) for r in web_results),
+            "web_supplement_count": len(supplemental_results),
             "web_fetch_error_count": sum(bool(r.get("fetch_error")) for r in web_results),
+            "web_publisher_blocked_count": sum(
+                r.get("access_status") == "publisher_blocked" for r in web_results
+            ),
+            "web_snippet_only_count": sum(
+                r.get("access_status") == "snippet_only_platform" for r in web_results
+            ),
             "web_blocked_count": sum(bool(r.get("blocked_count")) for r in web_results),
             "discussions_count": len(brave_data.get("discussions", [])),
             "news_count": len(brave_data.get("news", [])),
@@ -773,10 +996,14 @@ def build_serp_summary(serp_data: Dict[str, Any]) -> str:
 def analyze_serp(serp_data: Dict[str, Any]) -> str:
     """AI分析前の根拠データをPythonで集計・Markdown化する。"""
     web_results = serp_data.get("web", [])
+    analysis_results = serp_data.get("results") or [
+        result for result in web_results if result.get("eligible_for_analysis")
+    ]
+    supplemental_results = serp_data.get("web_analysis_supplement", [])
     h2_counter: Counter[str] = Counter()
     h3_counter: Counter[str] = Counter()
 
-    for result in web_results:
+    for result in analysis_results:
         if not result.get("eligible_for_analysis"):
             continue
         headings = result.get("headings", {})
@@ -795,8 +1022,12 @@ def analyze_serp(serp_data: Dict[str, Any]) -> str:
         "## Web evidence",
         "",
         "- Web結果件数: {0}".format(len(web_results)),
-        "- H2/H3取得成功件数: {0}".format(
+        "- 上位結果でのH2/H3取得成功件数: {0}".format(
             sum(bool(r.get("eligible_for_analysis")) for r in web_results)
+        ),
+        "- 補完ページを含む分析対象件数: {0}".format(len(analysis_results)),
+        "- HTTP 403等で配信元に拒否された上位ページ: {0}".format(
+            sum(r.get("access_status") == "publisher_blocked" for r in web_results)
         ),
         "",
         "### 頻出H2",
@@ -830,6 +1061,23 @@ def analyze_serp(serp_data: Dict[str, Any]) -> str:
                 "  - 見出し取得状態: {0}".format(
                     "; ".join(result.get("notes", [])) or "取得なし"
                 )
+            )
+
+    if supplemental_results:
+        lines.extend(["", "### H2/H3分析の補完ページ"])
+        for result in supplemental_results:
+            headings = result.get("headings", {})
+            lines.append(
+                "- {0}. {1}".format(
+                    result.get("rank"), result.get("title") or "(タイトルなし)"
+                )
+            )
+            lines.append("  - URL: {0}".format(result.get("url", "")))
+            lines.append(
+                "  - H2: {0}".format(json.dumps(headings.get("h2", []), ensure_ascii=False))
+            )
+            lines.append(
+                "  - H3: {0}".format(json.dumps(headings.get("h3", []), ensure_ascii=False))
             )
 
     for heading, key in (
@@ -1465,25 +1713,640 @@ H2見出し「{h2_title}」の本文だけを執筆してください。
     return full_article
 
 
-def step6_fact_check(llm: LLMService, article: str, run_dir: Path) -> str:
+def _load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _write_json_file(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _parse_json_response(text: str) -> Dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("AI response did not contain a JSON object.")
+    value = json.loads(cleaned[start : end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("AI response JSON was not an object.")
+    return value
+
+
+def _normalize_extracted_facts(value: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_facts = value.get("facts")
+    if not isinstance(raw_facts, list):
+        raise ValueError("Fact extraction response must contain a facts array.")
+
+    facts: List[Dict[str, Any]] = []
+    seen: set = set()
+    for raw in raw_facts:
+        if not isinstance(raw, dict):
+            continue
+        fact = _clean_text(raw.get("fact"))
+        if not fact:
+            continue
+        dedupe_key = re.sub(r"\s+", " ", fact).strip().lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        facts.append(
+            {
+                "id": "F{0:03d}".format(len(facts) + 1),
+                "fact": fact,
+                "context": _clean_text(raw.get("context")),
+                "search_query": _clean_text(raw.get("search_query")) or fact,
+                "time_sensitive": bool(raw.get("time_sensitive", False)),
+            }
+        )
+    return facts
+
+
+def _source_host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _search_fact_evidence(
+    fact: Dict[str, Any],
+    brave_api_key: str,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+    location_headers: Optional[Dict[str, str]] = None,
+    result_limit: int = 8,
+) -> Dict[str, Any]:
+    query = str(fact.get("search_query") or fact.get("fact") or "").strip()
+    if not query:
+        return dict(fact, sources=[], search_error="Empty search query.")
+
+    raw = _brave_get(
+        "/res/v1/web/search",
+        brave_api_key,
+        _web_search_params(
+            query,
+            result_limit,
+            country=country,
+            search_lang=search_lang,
+            ui_lang=ui_lang,
+        ),
+        label="Fact Check Web Search ({0})".format(fact.get("id", "fact")),
+        location_headers=location_headers,
+    )
+    candidates = _normalize_result_items(raw.get("web"), "fact_check")
+
+    sources: List[Dict[str, Any]] = []
+    seen_hosts: set = set()
+    seen_urls: set = set()
+    for item in candidates:
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        normalized_url = url.rstrip("/")
+        host = _source_host(url)
+        if normalized_url in seen_urls:
+            continue
+        if host and host in seen_hosts:
+            continue
+        seen_urls.add(normalized_url)
+        if host:
+            seen_hosts.add(host)
+        snippets = [str(item.get("snippet") or "").strip()]
+        snippets.extend(
+            str(value).strip()
+            for value in item.get("extra_snippets", [])
+            if str(value).strip()
+        )
+        sources.append(
+            {
+                "title": str(item.get("title") or host or url),
+                "url": url,
+                "host": host,
+                "snippet": " ".join(value for value in snippets if value),
+                "age": str(item.get("age") or ""),
+            }
+        )
+        if len(sources) >= 6:
+            break
+
+    result = dict(fact)
+    result.update(
+        {
+            "sources": sources,
+            "search_error": "",
+            "brave_query": raw.get("query") or {},
+        }
+    )
+    return result
+
+
+def _factcheck_batch_prompt(
+    factcheck_prompt: str, batch: List[Dict[str, Any]]
+) -> Tuple[str, str]:
+    schema_instruction = """
+
+## Evidence-based batch execution rules
+
+The web research has already been performed with Brave Search API. Do not use or request another web-search tool.
+Evaluate only the facts and evidence supplied in the user message.
+
+For each fact:
+- Separate what is supported, contradicted, missing, outdated, or context-dependent.
+- Aim to use at least three independent trustworthy sources when the supplied evidence permits.
+- Never invent a source, URL, quotation, statistic, publication date, or source conclusion.
+- If fewer than three independent sources are available, state that limitation and use `Needs Double-Checking` unless the evidence is otherwise decisive.
+- Source URLs in the output must be copied exactly from the supplied evidence.
+
+Return ONLY one valid JSON object in this schema:
+{
+  "results": [
+    {
+      "id": "F001",
+      "fact": "the fact exactly as evaluated",
+      "rating": "True | Minor Errors | Needs Double-Checking | False",
+      "evidence_summary": "concise reasoning",
+      "source_evaluation": "expertise, reliability, bias and independence assessment",
+      "context_and_timeliness": "missing context, date sensitivity, or currentness",
+      "sources": [
+        {"title": "source title", "url": "exact supplied URL"}
+      ],
+      "recommended_correction": "empty string when no correction is needed"
+    }
+  ]
+}
+"""
+    user_payload = {
+        "facts_with_brave_evidence": batch,
+        "required_result_count": len(batch),
+    }
+    return factcheck_prompt + schema_instruction, json.dumps(
+        user_payload, ensure_ascii=False, indent=2
+    )
+
+
+def _normalize_batch_results(
+    value: Dict[str, Any], batch: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    raw_results = value.get("results")
+    if not isinstance(raw_results, list):
+        raise ValueError("Fact-check batch response must contain a results array.")
+
+    evidence_by_id = {str(item.get("id")): item for item in batch}
+    parsed_by_id: Dict[str, Dict[str, Any]] = {}
+    allowed_ratings = {
+        "True",
+        "Minor Errors",
+        "Needs Double-Checking",
+        "False",
+    }
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        fact_id = str(raw.get("id") or "").strip()
+        if fact_id not in evidence_by_id:
+            continue
+        evidence = evidence_by_id[fact_id]
+        allowed_sources = {
+            str(source.get("url") or "").rstrip("/"): source
+            for source in evidence.get("sources", [])
+            if str(source.get("url") or "").strip()
+        }
+        sources: List[Dict[str, str]] = []
+        used_hosts: set = set()
+        raw_sources = raw.get("sources") if isinstance(raw.get("sources"), list) else []
+        for source in raw_sources:
+            if not isinstance(source, dict):
+                continue
+            candidate_url = str(source.get("url") or "").strip()
+            matched = allowed_sources.get(candidate_url.rstrip("/"))
+            if not matched:
+                continue
+            host = _source_host(candidate_url)
+            if host and host in used_hosts:
+                continue
+            if host:
+                used_hosts.add(host)
+            sources.append(
+                {
+                    "title": str(matched.get("title") or source.get("title") or candidate_url),
+                    "url": str(matched.get("url") or candidate_url),
+                }
+            )
+
+        if not sources:
+            for source in evidence.get("sources", [])[:3]:
+                sources.append(
+                    {
+                        "title": str(source.get("title") or source.get("url") or "Source"),
+                        "url": str(source.get("url") or ""),
+                    }
+                )
+
+        rating = str(raw.get("rating") or "Needs Double-Checking").strip()
+        if rating not in allowed_ratings:
+            rating = "Needs Double-Checking"
+        independent_hosts = {
+            _source_host(source.get("url", ""))
+            for source in sources
+            if source.get("url")
+        }
+        independent_hosts.discard("")
+        if len(independent_hosts) < 3 and rating == "True":
+            rating = "Needs Double-Checking"
+
+        parsed_by_id[fact_id] = {
+            "id": fact_id,
+            "fact": str(evidence.get("fact") or raw.get("fact") or ""),
+            "rating": rating,
+            "evidence_summary": _clean_text(raw.get("evidence_summary")),
+            "source_evaluation": _clean_text(raw.get("source_evaluation")),
+            "context_and_timeliness": _clean_text(raw.get("context_and_timeliness")),
+            "sources": sources,
+            "recommended_correction": _clean_text(raw.get("recommended_correction")),
+            "search_error": str(evidence.get("search_error") or ""),
+        }
+
+    normalized: List[Dict[str, Any]] = []
+    for evidence in batch:
+        fact_id = str(evidence.get("id"))
+        if fact_id in parsed_by_id:
+            normalized.append(parsed_by_id[fact_id])
+            continue
+        normalized.append(
+            {
+                "id": fact_id,
+                "fact": str(evidence.get("fact") or ""),
+                "rating": "Needs Double-Checking",
+                "evidence_summary": "AI batch response did not include this fact.",
+                "source_evaluation": "Insufficient evaluation data.",
+                "context_and_timeliness": "Manual review is required.",
+                "sources": [
+                    {
+                        "title": str(source.get("title") or source.get("url") or "Source"),
+                        "url": str(source.get("url") or ""),
+                    }
+                    for source in evidence.get("sources", [])[:3]
+                ],
+                "recommended_correction": "Verify this claim before publication.",
+                "search_error": str(evidence.get("search_error") or ""),
+            }
+        )
+    return normalized
+
+
+def _markdown_cell(value: Any) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", "<br>").strip()
+
+
+def _build_factcheck_report(
+    results: List[Dict[str, Any]],
+    *,
+    article_sha256: str,
+    extraction_count: int,
+) -> str:
+    ratings = [str(item.get("rating") or "Needs Double-Checking") for item in results]
+    if "False" in ratings:
+        overall = "False"
+    elif "Needs Double-Checking" in ratings:
+        overall = "Needs Double-Checking"
+    elif "Minor Errors" in ratings:
+        overall = "Minor Errors"
+    else:
+        overall = "True"
+
+    counts = Counter(ratings)
+    source_complete = 0
+    for item in results:
+        hosts = {
+            _source_host(source.get("url", ""))
+            for source in item.get("sources", [])
+            if source.get("url")
+        }
+        hosts.discard("")
+        if len(hosts) >= 3:
+            source_complete += 1
+
+    lines = [
+        "# Fact Check Report",
+        "",
+        "## Summary",
+        "",
+        "- **Overall reliability:** {0}".format(overall),
+        "- **Extracted facts:** {0}".format(extraction_count),
+        "- **Facts with 3+ independent sources:** {0}/{1}".format(
+            source_complete, len(results)
+        ),
+        "- **Ratings:** True={0}, Minor Errors={1}, Needs Double-Checking={2}, False={3}".format(
+            counts.get("True", 0),
+            counts.get("Minor Errors", 0),
+            counts.get("Needs Double-Checking", 0),
+            counts.get("False", 0),
+        ),
+        "- **Article SHA-256:** `{0}`".format(article_sha256),
+        "",
+        "Brave Search API collected the evidence. The selected AI evaluated facts in batches of five without using its native web-search tool.",
+        "",
+        "## Fact-by-fact results",
+        "",
+        "| ID | Fact | Rating | Evidence | Source evaluation | Context / timeliness | Sources | Recommended correction |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for item in results:
+        source_links: List[str] = []
+        for source in item.get("sources", []):
+            url = str(source.get("url") or "").strip()
+            title = str(source.get("title") or url or "Source").strip()
+            if url:
+                safe_title = title.replace("[", "\\[").replace("]", "\\]")
+                source_links.append("[{0}]({1})".format(safe_title, url))
+        evidence_summary = str(item.get("evidence_summary") or "")
+        if item.get("search_error"):
+            evidence_summary = "{0} Search error: {1}".format(
+                evidence_summary, item.get("search_error")
+            ).strip()
+        lines.append(
+            "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |".format(
+                _markdown_cell(item.get("id")),
+                _markdown_cell(item.get("fact")),
+                _markdown_cell(item.get("rating")),
+                _markdown_cell(evidence_summary),
+                _markdown_cell(item.get("source_evaluation")),
+                _markdown_cell(item.get("context_and_timeliness")),
+                _markdown_cell("<br>".join(source_links) or "(No source returned)"),
+                _markdown_cell(item.get("recommended_correction")),
+            )
+        )
+    return "\n".join(lines).strip() + "\n"
+
+
+def step6_fact_check(
+    llm: LLMService,
+    article: str,
+    run_dir: Path,
+    *,
+    brave_api_key: str,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+    location_headers: Optional[Dict[str, str]] = None,
+    batch_size: int = 5,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> str:
+    """Extract facts, collect Brave evidence, and evaluate resumable batches."""
     factcheck_prompt = load_prompt_file("factcheck-prompt.md")
+    extraction_prompt = load_prompt_file("fact-extraction-prompt.md")
     if not factcheck_prompt.strip():
         raise FileNotFoundError(
             "factcheck-prompt.mdが見つかりません。referencesに配置してください。"
         )
-    report = llm.generate(
-        factcheck_prompt,
-        article,
-        use_web_search=True,
-        temperature=0.2,
+    if not extraction_prompt.strip():
+        raise FileNotFoundError(
+            "fact-extraction-prompt.mdが見つかりません。referencesに配置してください。"
+        )
+    if not brave_api_key:
+        raise ValueError("Fact CheckにはBrave Search API Keyが必要です。")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+
+    article_sha256 = hashlib.sha256(article.encode("utf-8")).hexdigest()
+    workspace = run_dir / "10-fact-check"
+    state_path = workspace / "state.json"
+    context = {
+        "article_sha256": article_sha256,
+        "provider": llm.provider,
+        "model": llm.model,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "batch_size": batch_size,
+    }
+    previous_state = _load_json_file(state_path, {})
+    if previous_state.get("context") != context:
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        _write_json_file(state_path, {"context": context, "status": "started"})
+    else:
+        workspace.mkdir(parents=True, exist_ok=True)
+
+    facts_path = workspace / "01-facts.json"
+    facts_payload = _load_json_file(facts_path, {})
+    facts = facts_payload.get("facts") if isinstance(facts_payload, dict) else None
+    if not isinstance(facts, list):
+        if progress_callback:
+            progress_callback(0, 1, "Extracting individually verifiable facts from the article")
+        raw_facts = llm.generate(
+            extraction_prompt,
+            article,
+            use_web_search=False,
+            temperature=0.1,
+        )
+        parsed_facts = _parse_json_response(raw_facts)
+        facts = _normalize_extracted_facts(parsed_facts)
+        _write_json_file(
+            facts_path,
+            {
+                "article_sha256": article_sha256,
+                "facts": facts,
+                "raw_response": raw_facts,
+            },
+        )
+
+    if not facts:
+        report = (
+            "# Fact Check Report\n\n"
+            "記事から外部検証可能な事実主張を抽出できませんでした。"
+            "意見・提案・CTAだけで構成されている場合は、ファクトチェック対象がないことがあります。\n"
+        )
+        path = run_dir / "10-fact-check.md"
+        path.write_text(report, encoding="utf-8")
+        _write_json_file(
+            state_path,
+            {
+                "context": context,
+                "status": "complete",
+                "fact_count": 0,
+                "batch_count": 0,
+                "report": str(path),
+            },
+        )
+        update_run_manifest(
+            run_dir,
+            "done",
+            fact_check={
+                "fact_count": 0,
+                "batch_count": 0,
+                "search_provider": "brave",
+                "ai_provider": llm.provider,
+                "ai_model": llm.model,
+            },
+            artifacts={
+                **_read_manifest(run_dir).get("artifacts", {}),
+                "fact_check_workspace": str(workspace),
+                "fact_check": str(path),
+            },
+        )
+        return report
+
+    batch_size = max(1, int(batch_size))
+    batch_count = (len(facts) + batch_size - 1) // batch_size
+    total_steps = len(facts) + batch_count
+    completed_steps = 0
+    if progress_callback:
+        progress_callback(completed_steps, total_steps, "Preparing Brave evidence searches")
+
+    evidence_path = workspace / "02-evidence.json"
+    evidence_payload = _load_json_file(evidence_path, {})
+    evidence_by_id: Dict[str, Dict[str, Any]] = {}
+    if isinstance(evidence_payload, dict):
+        evidence_list = evidence_payload.get("facts")
+        if isinstance(evidence_list, list):
+            for item in evidence_list:
+                if (
+                    isinstance(item, dict)
+                    and item.get("id")
+                    and not str(item.get("search_error") or "").strip()
+                ):
+                    evidence_by_id[str(item["id"])] = item
+
+    fatal_search_markers = (" API error 401:", " API error 403:", " API error 429:")
+    for fact in facts:
+        fact_id = str(fact.get("id"))
+        if fact_id not in evidence_by_id:
+            try:
+                evidence_by_id[fact_id] = _search_fact_evidence(
+                    fact,
+                    brave_api_key,
+                    country=country,
+                    search_lang=search_lang,
+                    ui_lang=ui_lang,
+                    location_headers=location_headers,
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                failed = dict(fact)
+                failed.update({"sources": [], "search_error": error_text})
+                evidence_by_id[fact_id] = failed
+                ordered_evidence = [
+                    evidence_by_id[str(item.get("id"))]
+                    for item in facts
+                    if str(item.get("id")) in evidence_by_id
+                ]
+                _write_json_file(
+                    evidence_path,
+                    {"article_sha256": article_sha256, "facts": ordered_evidence},
+                )
+                if any(marker in error_text for marker in fatal_search_markers):
+                    raise
+            ordered_evidence = [
+                evidence_by_id[str(item.get("id"))]
+                for item in facts
+                if str(item.get("id")) in evidence_by_id
+            ]
+            _write_json_file(
+                evidence_path,
+                {"article_sha256": article_sha256, "facts": ordered_evidence},
+            )
+            time.sleep(0.15)
+        completed_steps += 1
+        if progress_callback:
+            progress_callback(
+                completed_steps,
+                total_steps,
+                "Brave evidence {0}/{1}: {2}".format(
+                    completed_steps, len(facts), fact_id
+                ),
+            )
+
+    all_results: List[Dict[str, Any]] = []
+    batches_dir = workspace / "03-batches"
+    batches_dir.mkdir(parents=True, exist_ok=True)
+    for batch_index in range(batch_count):
+        start = batch_index * batch_size
+        fact_batch = facts[start : start + batch_size]
+        evidence_batch = [evidence_by_id[str(item.get("id"))] for item in fact_batch]
+        batch_path = batches_dir / "batch-{0:03d}.json".format(batch_index + 1)
+        saved_batch = _load_json_file(batch_path, {})
+        batch_results = saved_batch.get("results") if isinstance(saved_batch, dict) else None
+        expected_ids = [str(item.get("id")) for item in fact_batch]
+        saved_ids = (
+            [str(item.get("id")) for item in batch_results]
+            if isinstance(batch_results, list)
+            else []
+        )
+
+        if not isinstance(batch_results, list) or saved_ids != expected_ids:
+            system_prompt, user_prompt = _factcheck_batch_prompt(
+                factcheck_prompt, evidence_batch
+            )
+            raw_batch = llm.generate(
+                system_prompt,
+                user_prompt,
+                use_web_search=False,
+                temperature=0.1,
+            )
+            parsed_batch = _parse_json_response(raw_batch)
+            batch_results = _normalize_batch_results(parsed_batch, evidence_batch)
+            _write_json_file(
+                batch_path,
+                {
+                    "batch": batch_index + 1,
+                    "fact_ids": expected_ids,
+                    "results": batch_results,
+                    "raw_response": raw_batch,
+                },
+            )
+        all_results.extend(batch_results)
+        completed_steps += 1
+        if progress_callback:
+            progress_callback(
+                completed_steps,
+                total_steps,
+                "AI verification batch {0}/{1}".format(batch_index + 1, batch_count),
+            )
+
+    report = _build_factcheck_report(
+        all_results,
+        article_sha256=article_sha256,
+        extraction_count=len(facts),
     )
     path = run_dir / "10-fact-check.md"
     path.write_text(report, encoding="utf-8")
+    _write_json_file(
+        state_path,
+        {
+            "context": context,
+            "status": "complete",
+            "fact_count": len(facts),
+            "batch_count": batch_count,
+            "report": str(path),
+        },
+    )
     update_run_manifest(
         run_dir,
         "done",
+        fact_check={
+            "fact_count": len(facts),
+            "batch_count": batch_count,
+            "search_provider": "brave",
+            "ai_provider": llm.provider,
+            "ai_model": llm.model,
+        },
         artifacts={
             **_read_manifest(run_dir).get("artifacts", {}),
+            "fact_check_workspace": str(workspace),
             "fact_check": str(path),
         },
     )
