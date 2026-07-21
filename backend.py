@@ -247,7 +247,7 @@ def _brave_get(
     return response.json()
 
 
-def _base_search_params(
+def _web_search_params(
     keyword: str,
     top_n: int,
     *,
@@ -266,6 +266,52 @@ def _base_search_params(
         "spellcheck": "true",
         "text_decorations": "false",
         "extra_snippets": "true",
+        "operators": "true",
+    }
+
+
+def _news_search_params(
+    keyword: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> dict[str, Any]:
+    # News Searchで公式に利用できるパラメータだけを送信する。
+    return {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 50),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": "true",
+        "extra_snippets": "true",
+        "operators": "true",
+    }
+
+
+def _video_search_params(
+    keyword: str,
+    top_n: int,
+    *,
+    country: str,
+    search_lang: str,
+    ui_lang: str,
+) -> dict[str, Any]:
+    # Video SearchにはWeb専用のtext_decorations/extra_snippetsを送信しない。
+    return {
+        "q": keyword,
+        "country": country,
+        "search_lang": search_lang,
+        "ui_lang": ui_lang,
+        "count": min(max(top_n, 1), 50),
+        "offset": 0,
+        "safesearch": "moderate",
+        "spellcheck": "true",
+        "operators": "true",
     }
 
 
@@ -278,18 +324,17 @@ def _search_brave(
     search_lang: str,
     ui_lang: str,
 ) -> dict[str, Any]:
-    """Braveの専用エンドポイントとsite検索から用途別SERPを取得する。"""
-    base = _base_search_params(
+    """用途別エンドポイントを個別実行し、失敗したカテゴリだけエラーとして保持する。"""
+    errors: dict[str, str] = {}
+    raw_response: dict[str, Any] = {}
+
+    web_params = _web_search_params(
         keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
     )
-
-    # 1) Web: GET /res/v1/web/search
-    web_raw = _brave_get(
-        "/res/v1/web/search", api_key, base, label="Web Search"
-    )
+    web_raw = _brave_get("/res/v1/web/search", api_key, web_params, label="Web Search")
+    raw_response["web"] = web_raw
     web_items = _normalize_result_items(web_raw.get("web"), "web")[:top_n]
 
-    # 2) Discussions: 専用endpointは使わず、Web Search + site: 演算子で3媒体を取得
     discussion_sites = [
         ("Reddit", "reddit.com"),
         ("Yahoo!知恵袋", "chiebukuro.yahoo.co.jp"),
@@ -299,47 +344,68 @@ def _search_brave(
     discussion_raw: dict[str, Any] = {}
     per_site_count = min(max(top_n, 1), 10)
     for source_label, site in discussion_sites:
-        params = _base_search_params(
-            f"{keyword} site:{site}",
-            per_site_count,
-            country=country,
-            search_lang=search_lang,
-            ui_lang=ui_lang,
+        try:
+            params = _web_search_params(
+                f"{keyword} site:{site}",
+                per_site_count,
+                country=country,
+                search_lang=search_lang,
+                ui_lang=ui_lang,
+            )
+            data = _brave_get(
+                "/res/v1/web/search", api_key, params, label=f"Discussions ({source_label})"
+            )
+            discussion_raw[site] = data
+            items = _normalize_result_items(data.get("web"), "discussions")
+            for item in items:
+                item["source"] = source_label
+                item["site"] = site
+                item["discussion_query"] = params["q"]
+            discussions.extend(items)
+        except Exception as exc:
+            errors[f"discussions:{site}"] = str(exc)
+    raw_response["discussions"] = discussion_raw
+
+    news_items: list[dict[str, Any]] = []
+    try:
+        news_params = _news_search_params(
+            keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
         )
-        data = _brave_get(
-            "/res/v1/web/search", api_key, params, label=f"Discussions ({source_label})"
+        news_raw = _brave_get("/res/v1/news/search", api_key, news_params, label="News Search")
+        raw_response["news"] = news_raw
+        news_items = _normalize_result_items(news_raw.get("results"), "news")[:top_n]
+    except Exception as exc:
+        errors["news"] = str(exc)
+        raw_response["news"] = {}
+
+    video_items: list[dict[str, Any]] = []
+    try:
+        video_params = _video_search_params(
+            keyword, top_n, country=country, search_lang=search_lang, ui_lang=ui_lang
         )
-        discussion_raw[site] = data
-        items = _normalize_result_items(data.get("web"), "discussions")
-        for item in items:
-            item["source"] = source_label
-            item["site"] = site
-            item["discussion_query"] = params["q"]
-        discussions.extend(items)
+        videos_raw = _brave_get("/res/v1/videos/search", api_key, video_params, label="Videos Search")
+        raw_response["videos"] = videos_raw
+        video_items = _normalize_result_items(videos_raw.get("results"), "videos")[:top_n]
+    except Exception as exc:
+        errors["videos"] = str(exc)
+        raw_response["videos"] = {}
 
-    # 4) News: GET /res/v1/news/search
-    news_raw = _brave_get(
-        "/res/v1/news/search", api_key, base, label="News Search"
-    )
-    news_items = _normalize_result_items(news_raw.get("results"), "news")[:top_n]
-
-    # 5) Videos: GET /res/v1/videos/search
-    videos_raw = _brave_get(
-        "/res/v1/videos/search", api_key, base, label="Videos Search"
-    )
-    video_items = _normalize_result_items(videos_raw.get("results"), "videos")[:top_n]
-
-    # 6) Entity: GET /res/v1/suggest/search?q=...&rich=true
-    suggest_params = {
-        "q": keyword,
-        "country": country,
-        "count": min(max(top_n, 1), 10),
-        "rich": "true",
-    }
-    suggest_raw = _brave_get(
-        "/res/v1/suggest/search", api_key, suggest_params, label="Autosuggest"
-    )
-    entity_items = _normalize_entity_suggestions(suggest_raw.get("results"))
+    entity_items: list[dict[str, Any]] = []
+    try:
+        suggest_params = {
+            "q": keyword,
+            "country": country,
+            "count": min(max(top_n, 1), 10),
+            "rich": "true",
+        }
+        suggest_raw = _brave_get(
+            "/res/v1/suggest/search", api_key, suggest_params, label="Autosuggest"
+        )
+        raw_response["entity"] = suggest_raw
+        entity_items = _normalize_entity_suggestions(suggest_raw.get("results"))
+    except Exception as exc:
+        errors["entity"] = str(exc)
+        raw_response["entity"] = {}
 
     return {
         "web": web_items,
@@ -348,13 +414,8 @@ def _search_brave(
         "videos": video_items,
         "entity": entity_items,
         "query": web_raw.get("query") or {},
-        "raw_response": {
-            "web": web_raw,
-            "discussions": discussion_raw,
-            "news": news_raw,
-            "videos": videos_raw,
-            "entity": suggest_raw,
-        },
+        "errors": errors,
+        "raw_response": raw_response,
     }
 
 def step2_fetch_serp_and_filter(

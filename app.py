@@ -258,15 +258,35 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
                         st.write("H2:", result.get("headings", {}).get("h2", []))
                         st.write("H3:", result.get("headings", {}).get("h3", []))
                         st.divider()
+            errors = data.get("errors") or {}
             with tabs[1]:
                 st.markdown("<div class='serp-purpose'>ユーザーの本音・Pain Pointの抽出に利用</div>", unsafe_allow_html=True)
-                st.dataframe(rows_for(data.get("discussions", [])), use_container_width=True, hide_index=True)
+                discussion_rows = rows_for(data.get("discussions", []))
+                if discussion_rows:
+                    st.dataframe(discussion_rows, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Discussion result was not returned for this query.")
+                discussion_errors = [v for k, v in errors.items() if k.startswith("discussions:")]
+                for message in discussion_errors:
+                    st.error(message)
             with tabs[2]:
                 st.markdown("<div class='serp-purpose'>鮮度・更新性・最新情報・変更点の確認に利用（News Search API）</div>", unsafe_allow_html=True)
-                st.dataframe(rows_for(data.get("news", [])), use_container_width=True, hide_index=True)
+                news_rows = rows_for(data.get("news", []))
+                if news_rows:
+                    st.dataframe(news_rows, use_container_width=True, hide_index=True)
+                else:
+                    st.info("News result was not returned for this query.")
+                if errors.get("news"):
+                    st.error(errors["news"])
             with tabs[3]:
                 st.markdown("<div class='serp-purpose'>体験・理解促進・手順・比較・実演の把握に利用（Videos Search API）</div>", unsafe_allow_html=True)
-                st.dataframe(rows_for(data.get("videos", [])), use_container_width=True, hide_index=True)
+                video_rows = rows_for(data.get("videos", []))
+                if video_rows:
+                    st.dataframe(video_rows, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Video result was not returned for this query.")
+                if errors.get("videos"):
+                    st.error(errors["videos"])
             with tabs[4]:
                 st.markdown("<div class='serp-purpose'>Autosuggest APIのrich=trueでEntity候補・関連候補を取得</div>", unsafe_allow_html=True)
                 entities = data.get("entity") or []
@@ -283,6 +303,8 @@ with st.expander("2. SERP Research — 複数SERPタイプの取得・分析", e
                     st.dataframe(entity_rows, use_container_width=True, hide_index=True)
                 else:
                     st.info("Entity / rich suggestion result was not returned for this query.")
+                if errors.get("entity"):
+                    st.error(errors["entity"])
             with tabs[5]:
                 st.markdown(st.session_state.serp_analysis or "")
 
